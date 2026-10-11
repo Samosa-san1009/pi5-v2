@@ -1,0 +1,11 @@
+# local environment and build output
+.venv/
+native/purest/build/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# per-rig data: never committed
+sessions/
+device_settings.json
+device_settings.tmp

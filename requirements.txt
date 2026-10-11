@@ -1,0 +1,7 @@
+# pip packages for the Pi (installed into .venv by scripts/install.sh).
+# Everything else (picamera2, libcamera, numpy, Pillow, Flask, lgpio, spidev)
+# comes from APT so it matches the OS's camera stack.
+luma.lcd>=2.11
+Adafruit-Blinka>=8.50
+Adafruit-Blinka-Raspberry-Pi5-Neopixel>=1.0
+rpi-lgpio>=0.6

@@ -1,0 +1,20 @@
+[Unit]
+Description=Mobile PLR (camera, WS2812 LEDs, endstops, TFT, PuReST on both eyes)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@USER@
+SupplementaryGroups=video gpio spi
+WorkingDirectory=@REPO@
+Environment=PYTHONUNBUFFERED=1
+ExecStart=@REPO@/.venv/bin/python @REPO@/server.py
+Restart=always
+RestartSec=3
+# Slight priority boost for the always-on camera; offline PuReST runs niced
+# on cores 2-3 (see purest.cpus / offline_nice in the settings).
+Nice=-5
+
+[Install]
+WantedBy=multi-user.target
