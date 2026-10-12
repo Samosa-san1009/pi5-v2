@@ -18,6 +18,21 @@ import time
 from datetime import datetime
 
 
+class NoBacklight:
+    """Backlight 'controller' that touches no GPIO.
+
+    luma.lcd drives a backlight pin on GPIO18 by default. This 7-pin panel has
+    no backlight pin (the backlight is tied to VCC), and GPIO18 is the left
+    WS2812's data pin, so luma must never claim it.
+    """
+
+    def __call__(self, is_enabled: bool):
+        pass
+
+    def cleanup(self):
+        pass
+
+
 def local_ip() -> str:
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
@@ -74,9 +89,10 @@ class TftDisplay:
         cfg = self.settings
         serial = spi(port=int(cfg["spi_port"]), device=int(cfg["spi_device"]), gpio_DC=int(cfg["gpio_dc"]),
                      gpio_RST=int(cfg["gpio_rst"]), bus_speed_hz=int(cfg["bus_speed_hz"]))
-        # active_low=False: this 7-pin panel has its backlight tied to VCC.
+        # The backlight is tied to VCC: pass a no-op backlight so luma does not
+        # claim its default backlight pin, GPIO18 (the left LED).
         return st7789(serial, width=int(cfg["width"]), height=int(cfg["height"]),
-                      rotate=int(cfg["rotate"]), active_low=False)
+                      rotate=int(cfg["rotate"]), backlight=NoBacklight())
 
     def _run(self):
         from PIL import Image

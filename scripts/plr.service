@@ -9,6 +9,7 @@ User=@USER@
 SupplementaryGroups=video gpio spi
 WorkingDirectory=@REPO@
 Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONNOUSERSITE=1
 ExecStart=@REPO@/.venv/bin/python @REPO@/server.py
 Restart=always
 RestartSec=3

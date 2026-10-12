@@ -768,6 +768,9 @@ def unexpected(exc):
 
 
 def main():
+    import faulthandler
+
+    faulthandler.enable()      # a native crash prints every thread's stack to the journal
     SESSIONS_ROOT.mkdir(parents=True, exist_ok=True)
     build_rig()
     atexit.register(shutdown)

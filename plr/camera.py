@@ -197,7 +197,11 @@ class CameraService:
             if want_live:
                 width, height = self.settings["resolution"]
                 with MappedArray(request, "main") as mapped:
-                    grey = np.ascontiguousarray(mapped.array[:height, :width])
+                    # Always copy: the camera reuses this buffer for later
+                    # frames, so no view of it may outlive the `with` block.
+                    # (np.ascontiguousarray would return a view whenever the
+                    # slice is already contiguous -> BufferError, then SEGV.)
+                    grey = mapped.array[:height, :width].copy()
                 tap.submit(grey, self._frames_total, ts)
             if want_lores:
                 self._last_lores_ns = now

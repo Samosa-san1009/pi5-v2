@@ -3,5 +3,6 @@
 # comes from APT so it matches the OS's camera stack.
 luma.lcd>=2.11
 Adafruit-Blinka>=8.50
-Adafruit-Blinka-Raspberry-Pi5-Neopixel>=1.0
+# Only release candidates exist so far; rc2 has a ready wheel for Python 3.13 on the Pi 5.
+Adafruit-Blinka-Raspberry-Pi5-Neopixel>=1.0.0rc2
 rpi-lgpio>=0.6

@@ -11,17 +11,24 @@ Brightness model (per colour channel, 0-255):
 - channel_gain  optional per-channel calibration (0-1)
 
 On a Pi 5 the LEDs are driven through the RP1 PIO block with Adafruit's
-`adafruit_raspberry_pi5_neopixel_write`, which works on any GPIO and needs no
-root. The command timestamps returned here are only the moment the data was
-handed to the driver; the true light onset is measured by the endstops.
+`adafruit_raspberry_pi5_neopixel_write`. That driver crashed (SEGV) when
+called from the server's request threads while the camera was streaming, so
+every write happens in a small helper process that owns both LEDs and does
+all writes from one thread. If the driver ever crashes again only the helper
+dies; the next write starts a new one. The command timestamps returned here
+are CLOCK_MONOTONIC (system-wide, so valid across processes) around the
+write; the true light onset is measured by the endstops.
 """
 
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
 SIDES = ("left", "right")
 
@@ -75,31 +82,121 @@ class LedConfig:
         return bytearray(pixel * self.pixel_count)
 
 
-class _PioBackend:
-    """Raspberry Pi 5 PIO WS2812 output (any GPIO)."""
+# ── helper process (owns the PIO driver) ────────────────────────────────────
+#
+# stdin:  W <gpio>:<hex> [<gpio>:<hex> ...]      write those frames, in order
+# stdout: READY | OK <t0>:<t1> [...] | ERR <message>
 
-    name = "pi5_pio"
+def _helper_main() -> int:
+    import faulthandler
 
-    def __init__(self):
-        try:
+    faulthandler.enable()
+    try:
+        fake_log = os.environ.get("PLR_LED_HELPER_FAKE")      # tests only
+        if fake_log:
+            def write(gpio: int, data: bytearray):
+                with open(fake_log, "a") as handle:
+                    handle.write(f"{gpio} {data.hex()}\n")
+        else:
             import board  # adafruit-blinka
             from adafruit_raspberry_pi5_neopixel_write import neopixel_write
+
+            pins: dict[int, object] = {}
+
+            def write(gpio: int, data: bytearray):
+                pin = pins.get(gpio)
+                if pin is None:
+                    pin = pins[gpio] = getattr(board, f"D{gpio}")
+                neopixel_write(pin, data)
+    except Exception as exc:
+        print(f"ERR {type(exc).__name__}: {exc}", flush=True)
+        return 1
+    print("READY", flush=True)
+    for line in sys.stdin:
+        parts = line.split()
+        if not parts:
+            continue
+        if parts[0] != "W":
+            print("ERR unknown command", flush=True)
+            continue
+        stamps = []
+        try:
+            for item in parts[1:]:
+                gpio, hexdata = item.split(":")
+                t0 = time.monotonic_ns()
+                write(int(gpio), bytearray.fromhex(hexdata))
+                stamps.append(f"{t0}:{time.monotonic_ns()}")
+            print("OK " + " ".join(stamps), flush=True)
         except Exception as exc:
+            print(f"ERR {type(exc).__name__}: {exc}", flush=True)
+    return 0
+
+
+class _HelperBackend:
+    """Pi 5 PIO WS2812 output, via the helper process."""
+
+    name = "pi5_pio_helper"
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._proc = None
+        self.restarts = 0
+        self.last_crash: str | None = None
+        self._spawn()
+
+    def _spawn(self):
+        cmd = [sys.executable, "-u", str(Path(__file__).resolve()), "--helper"]
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1)
+        line = (proc.stdout.readline() or "").strip()
+        if line != "READY":
+            proc.kill()
             raise LedHardwareUnavailable(
-                "Pi 5 WS2812 driver unavailable: install "
-                "'Adafruit-Blinka-Raspberry-Pi5-Neopixel' and check /dev/pio0 "
-                f"exists ({type(exc).__name__}: {exc})"
-            ) from exc
-        self._board = board
-        self._write = neopixel_write
-        self._pins: dict[int, object] = {}
+                "Pi 5 WS2812 driver unavailable: install 'Adafruit-Blinka-Raspberry-Pi5-Neopixel' and "
+                f"check /dev/pio0 exists ({line or 'helper exited during start-up'})")
+        self._proc = proc
+
+    def write_many(self, items: list[tuple[int, bytearray]]) -> list[tuple[int, int]]:
+        message = "W " + " ".join(f"{gpio}:{bytes(data).hex()}" for gpio, data in items) + "\n"
+        with self._lock:
+            for _attempt in range(2):
+                if self._proc is None or self._proc.poll() is not None:
+                    if self._proc is not None:
+                        self.last_crash = f"helper exited with code {self._proc.poll()}"
+                    self._spawn()
+                    self.restarts += 1
+                try:
+                    self._proc.stdin.write(message)
+                    self._proc.stdin.flush()
+                    reply = (self._proc.stdout.readline() or "").strip()
+                except (BrokenPipeError, OSError):
+                    reply = ""
+                if reply.startswith("OK"):
+                    return [tuple(int(v) for v in pair.split(":")) for pair in reply.split()[1:]]
+                if reply.startswith("ERR"):
+                    raise RuntimeError(f"WS2812 write failed: {reply[4:]}")
+                # The helper died mid-write: note it, retry once with a fresh helper.
+                code = None
+                if self._proc is not None:
+                    try:
+                        code = self._proc.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        self._proc.kill()
+                        code = "hung (killed)"
+                self.last_crash = f"helper exited with code {code} during a write"
+                self._proc = None
+            raise LedHardwareUnavailable(f"WS2812 helper keeps crashing ({self.last_crash})")
 
     def write(self, gpio: int, data: bytearray):
-        pin = self._pins.get(gpio)
-        if pin is None:
-            pin = getattr(self._board, f"D{gpio}")
-            self._pins[gpio] = pin
-        self._write(pin, data)
+        self.write_many([(gpio, data)])
+
+    def close(self):
+        proc, self._proc = self._proc, None
+        if proc is not None:
+            try:
+                proc.stdin.close()
+                proc.wait(timeout=2)
+            except Exception:
+                proc.kill()
 
 
 class _MockBackend:
@@ -112,6 +209,9 @@ class _MockBackend:
     def write(self, gpio: int, data: bytearray):
         for listener in list(self.listeners):
             listener(gpio, bytes(data), time.monotonic_ns())
+
+    def close(self):
+        pass
 
 
 class LedController:
@@ -126,14 +226,13 @@ class LedController:
             self.backend = _MockBackend()
         else:
             try:
-                self.backend = _PioBackend()
+                self.backend = _HelperBackend()
             except LedHardwareUnavailable as exc:
                 if requested == "auto" and os.environ.get("PLR_ALLOW_MOCK") == "1":
                     self.backend = _MockBackend()
-                    self.error = str(exc)
                 else:
                     self.backend = None
-                    self.error = str(exc)
+                self.error = str(exc)
         self.configs = {side: LedConfig.from_settings(side, led_settings[side]) for side in SIDES}
         self._map_mock_pins()
         self._lock = threading.Lock()
@@ -165,6 +264,8 @@ class LedController:
             "backend": getattr(self.backend, "name", None),
             "mock": self.is_mock,
             "error": self.error,
+            "helper_restarts": getattr(self.backend, "restarts", 0),
+            "helper_last_crash": getattr(self.backend, "last_crash", None),
             "leds": {
                 side: {
                     "gpio": cfg.gpio,
@@ -181,33 +282,47 @@ class LedController:
             old = self.configs
             self.configs = {side: LedConfig.from_settings(side, led_settings[side]) for side in SIDES}
             self._map_mock_pins()
-            for side in SIDES:
-                if old[side].gpio != self.configs[side].gpio and self.backend is not None:
-                    self.backend.write(old[side].gpio, old[side].frame((0, 0, 0)))
+            moved = [(None, old[side].gpio, old[side].frame((0, 0, 0))) for side in SIDES
+                     if old[side].gpio != self.configs[side].gpio]
+            if moved and self.backend is not None:
+                self._write(moved)
         self.all_off()
 
     # ── output ──────────────────────────────────────────────────────────────
+    def _write(self, items: list) -> list[tuple[int, int]]:
+        """items: [(side, gpio, frame)]; returns [(t0_ns, t1_ns)] per item."""
+        if hasattr(self.backend, "write_many"):
+            return self.backend.write_many([(gpio, data) for _side, gpio, data in items])
+        stamps = []
+        for _side, gpio, data in items:
+            t0 = time.monotonic_ns()
+            self.backend.write(gpio, data)
+            stamps.append((t0, time.monotonic_ns()))
+        return stamps
+
     def set(self, colors: dict[str, tuple[int, int, int]]) -> dict:
         """Set one or both LEDs to raw RGB bytes; return a command envelope.
 
-        Both writes happen back to back inside one lock, so in dual mode the
-        two LEDs change within a few tens of microseconds of each other.
+        Both frames go to the driver in one message and are written back to
+        back, so in dual mode the two LEDs change within a fraction of a
+        millisecond of each other.
         """
         if self.backend is None:
             raise LedHardwareUnavailable(self.error or "LED backend unavailable")
         with self._lock:
-            start = time.monotonic_ns()
-            per_side = {}
+            items = []
             for side, rgb in colors.items():
                 cfg = self.configs[side]
                 if not cfg.enabled:
                     rgb = (0, 0, 0)
-                t0 = time.monotonic_ns()
-                self.backend.write(cfg.gpio, cfg.frame(rgb))
-                t1 = time.monotonic_ns()
-                self._state[side] = tuple(rgb)
-                per_side[side] = {"start_ns": t0, "end_ns": t1, "rgb": list(rgb)}
+                items.append((side, cfg.gpio, cfg.frame(rgb), tuple(rgb)))
+            start = time.monotonic_ns()
+            stamps = self._write([(side, gpio, frame) for side, gpio, frame, _ in items])
             end = time.monotonic_ns()
+            per_side = {}
+            for (side, _gpio, _frame, rgb), (t0, t1) in zip(items, stamps):
+                self._state[side] = rgb
+                per_side[side] = {"start_ns": t0, "end_ns": t1, "rgb": list(rgb)}
         for side, info in per_side.items():
             for listener in list(self.state_listeners):
                 try:
@@ -229,3 +344,11 @@ class LedController:
             self.all_off()
         except Exception:
             pass
+        try:
+            self.backend.close()
+        except Exception:
+            pass
+
+
+if __name__ == "__main__" and "--helper" in sys.argv:
+    sys.exit(_helper_main())

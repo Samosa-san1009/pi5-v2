@@ -81,10 +81,12 @@ DEFAULTS: dict = {
         "spi_device": 0,
         "gpio_dc": 24,                # physical pin 18
         "gpio_rst": 25,               # physical pin 22
-        "width": 240,
-        "height": 320,
-        # 0-3. 1 = landscape so the 4:3 camera picture is not stretched.
-        "rotate": 1,
+        # luma's ST7789 driver puts the controller in landscape itself, so the
+        # 240x320 panel is driven as 320 wide x 240 tall with no extra
+        # rotation: the 4:3 camera picture fills it exactly. rotate 2 = upside down.
+        "width": 320,
+        "height": 240,
+        "rotate": 0,
         "bus_speed_hz": 40_000_000,
         "fps": 15,
         "overlay": True,

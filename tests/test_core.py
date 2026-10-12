@@ -227,3 +227,117 @@ def test_metrics_with_sensor_times_and_dropped_frames():
     assert 230 <= with_times["latency_ms"] <= 300
     naive = calculate_plr_metrics(frames, diam, fps, onset, smoothing_window=1)
     assert abs(naive["latency_ms"] - with_times["latency_ms"]) > 50   # nominal fps is ~100 ms off
+
+
+# ── TFT must not claim GPIO18 (left LED) ──────────────────────────────────
+
+def test_display_never_claims_gpio18(monkeypatch):
+    """luma.lcd defaults to a backlight on GPIO18; the rig passes a no-op one."""
+    import types
+    from plr.display import NoBacklight, TftDisplay
+
+    captured = {}
+    serial_mod = types.ModuleType("luma.core.interface.serial")
+    serial_mod.spi = lambda **kw: captured.setdefault("spi", kw) or kw
+    device_mod = types.ModuleType("luma.lcd.device")
+
+    def st7789(serial, **kw):
+        captured["st7789"] = kw
+        return object()
+
+    device_mod.st7789 = st7789
+    for name in ("luma", "luma.core", "luma.core.interface", "luma.lcd"):
+        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+    monkeypatch.setitem(sys.modules, "luma.core.interface.serial", serial_mod)
+    monkeypatch.setitem(sys.modules, "luma.lcd.device", device_mod)
+
+    s = settings()
+    TftDisplay(s["display"], s["camera"], s["eye_roi"], camera=None, state_provider=dict)._make_device()
+    assert isinstance(captured["st7789"]["backlight"], NoBacklight)
+    assert "gpio_LIGHT" not in captured["st7789"]
+    assert {captured["spi"]["gpio_DC"], captured["spi"]["gpio_RST"]} == {24, 25}
+    assert 18 not in captured["spi"].values()
+
+
+# ── camera frames handed to PuReST must not reference the camera buffer ────
+
+def test_live_frames_are_copied_out_of_the_camera_buffer(monkeypatch):
+    """A view escaping MappedArray made picamera2 fail (BufferError) and later SEGV."""
+    import mmap
+    import types
+    from contextlib import contextmanager
+    from plr.camera import CameraService
+
+    w, h = 640, 480
+    buf = mmap.mmap(-1, w * h * 3 // 2)       # YUV420 frame, like libcamera's dmabuf
+
+    @contextmanager
+    def MappedArray(request, stream):
+        mapped = types.SimpleNamespace(array=np.frombuffer(buf, dtype=np.uint8).reshape(h * 3 // 2, w))
+        try:
+            yield mapped
+        finally:
+            mapped.array = None                # like picamera2: drop its own reference
+            buf.close()                        # BufferError if the caller kept a view
+
+    picamera2 = types.ModuleType("picamera2")
+    picamera2.MappedArray = MappedArray
+    monkeypatch.setitem(sys.modules, "picamera2", picamera2)
+
+    got = []
+
+    class Tap:
+        def wants(self, ts):
+            return True
+
+        def submit(self, grey, seq, ts):
+            got.append(grey)
+
+    cam = CameraService(settings()["camera"])
+    cam.frame_tap = Tap()
+    cam._last_lores_ns = 2 ** 62               # skip the lores copy in this test
+    request = types.SimpleNamespace(get_metadata=lambda: {"SensorTimestamp": 123})
+    cam._on_frame(request)
+    assert buf.closed                          # the camera buffer could be released
+    assert len(got) == 1 and got[0].shape == (h, w) and got[0].flags.owndata
+
+
+# ── WS2812 helper process ──────────────────────────────────────────────────
+
+def _helper_leds(tmp_path, monkeypatch):
+    from plr.leds import LedController
+    log = tmp_path / "led.log"
+    monkeypatch.setenv("PLR_LED_HELPER_FAKE", str(log))
+    monkeypatch.delenv("PLR_HARDWARE", raising=False)
+    leds = LedController(settings()["leds"])
+    assert leds.ready and leds.status()["backend"] == "pi5_pio_helper", leds.error
+    return leds, log
+
+
+def test_led_helper_writes_both_leds_in_order_from_any_thread(tmp_path, monkeypatch):
+    leds, log = _helper_leds(tmp_path, monkeypatch)
+    try:
+        log.write_text("")
+        results = []
+        worker = threading.Thread(target=lambda: results.append(leds.set({"left": (255, 0, 0), "right": (0, 0, 255)})))
+        worker.start(); worker.join(10)
+        env = results[0]
+        assert log.read_text().split("\n")[:2] == ["18 00ff00", "13 0000ff"]   # GRB byte order
+        l, r = env["sides"]["left"], env["sides"]["right"]
+        assert env["start_ns"] <= l["start_ns"] <= l["end_ns"] <= r["start_ns"] <= r["end_ns"] <= env["end_ns"]
+        assert leds.status()["leds"]["left"]["current_rgb"] == [255, 0, 0]
+    finally:
+        leds.close()
+
+
+def test_led_helper_crash_does_not_take_the_server_down(tmp_path, monkeypatch):
+    leds, log = _helper_leds(tmp_path, monkeypatch)
+    try:
+        leds.backend._proc.kill()                       # simulate the driver segfaulting
+        leds.backend._proc.wait()
+        leds.set({"left": (1, 2, 3)})                   # next write starts a fresh helper
+        assert leds.status()["helper_restarts"] == 1
+        assert "exited" in leds.status()["helper_last_crash"]
+        assert log.read_text().strip().endswith("18 020103")
+    finally:
+        leds.close()

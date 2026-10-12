@@ -186,8 +186,9 @@ or watch the TFT.
    pick the IR one:
    `curl -X POST localhost:5000/settings -H 'Content-Type: application/json' -d '{"camera":{"index":1}}'`
    then `curl -X POST localhost:5000/restart`.
-2. **Screen orientation.** If the picture is rotated, try `rotate` 0–3:
-   `-d '{"display":{"rotate":3}}'`, then restart.
+2. **Screen orientation.** If the picture is upside down, set `rotate` to 2:
+   `-d '{"display":{"rotate":2}}'`, then restart. Keep `width` 320 and
+   `height` 240: other sizes leave part of the panel unwritten.
 3. **Eye boxes (ROIs).** The blue box must contain the eye the **left** LED
    shines into, and the red box the eye the right LED shines into. Each box
    should hold the whole eye with some margin. Values are fractions of the
@@ -283,7 +284,7 @@ Your settings and recorded sessions are kept.
 | `leds.<side>.gpio` / `power_pct` | 18 / 13, 100 | WS2812 pins and per-eye brightness |
 | `endstops.<side>.gpio` | 17 / 27 | endstop signal pins |
 | `camera.index`, `resolution`, `fps` | auto, 640×480, 30 | camera |
-| `display.rotate` | 1 | TFT orientation |
+| `display.width` / `height` / `rotate` | 320 / 240 / 0 | TFT size as driven; `rotate` 2 = upside down |
 | `session.pre_roll_s` / `post_roll_s` | 1 / 3 | recording before the first / after the last flash |
 
 ### Session files
@@ -307,7 +308,8 @@ Your settings and recorded sessions are kept.
 | `/health` camera not running | Cable; `rpicam-hello --list-cameras`; is anything else using the camera? Run `bash scripts/remove_old_ir_display.sh` again. |
 | LEDs not ready / `/dev/pio0` missing | `sudo apt full-upgrade`, reboot, re-run the installer. |
 | Endstop "reads ACTIVE with LEDs off" | Ambient light reaches the sensor, or the polarity is wrong: set `endstops.<side>.active` to `low`/`high`. |
-| TFT stays black | VCC on pin 17? SPI enabled (re-run the installer, reboot)? Try other `display.rotate` values. |
+| TFT stays black | VCC on pin 17? SPI enabled (re-run the installer, reboot)? |
+| TFT picture turned 90° or a coloured strip at one side | `display` must be `width` 320, `height` 240, `rotate` 0 (or 2). |
 | Trace jumps to iris size | Set `purest.max_pupil_px` (step 7.5) and tighten the eye boxes. |
 | App result came from `offline` and took longer | The live pass dropped frames: check `/purest` and keep other programs off the Pi. |
 

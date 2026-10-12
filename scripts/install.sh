@@ -15,6 +15,9 @@
 #   7. permissions for camera, GPIO, SPI and /dev/pio0 (WS2812 driver)
 #   8. installs and starts plr.service
 set -euo pipefail
+# Ignore packages in ~/.local (e.g. from an old pip install --break-system-packages):
+# they would shadow the versions this rig installs into .venv.
+export PYTHONNOUSERSITE=1
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 SERVICE_USER="${SUDO_USER:-$USER}"
@@ -78,6 +81,14 @@ if ! grep -qE '^\s*dtparam=spi=on' "$CONFIG"; then
   REBOOT=1
 else
   echo "SPI already enabled"
+fi
+# The SPI1 overlays (spi1-1cs, spi1-2cs, ...) claim GPIO18 - the left LED pin -
+# as SPI1 chip select, so the WS2812 driver could not use it. Comment them out.
+if grep -qE '^\s*dtoverlay=spi1-' "$CONFIG"; then
+  sudo cp "$CONFIG" "$CONFIG.before-plr-spi1"
+  sudo sed -i -E 's/^(\s*dtoverlay=spi1-.*)$/# \1   # removed: takes GPIO18 (left LED)/' "$CONFIG"
+  echo "commented out the SPI1 overlay - it takes GPIO18, the left LED pin (backup: $CONFIG.before-plr-spi1)"
+  REBOOT=1
 fi
 if grep -qE '^\s*dtoverlay=i2c-rtc' "$CONFIG"; then
   sudo cp "$CONFIG" "$CONFIG.before-plr"
