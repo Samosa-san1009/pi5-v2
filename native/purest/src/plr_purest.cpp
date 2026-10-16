@@ -1,10 +1,9 @@
-// plr_purest -- PuReST pupil tracking on BOTH eyes in parallel.
+// plr_purest -- lightweight PuReST Soft Flow pupil tracking on BOTH eyes in parallel.
 //
 // One process, one decoder/reader thread, and one worker thread per eye.
 // Every frame is handed to both eye workers at the same time; each worker
-// owns its own PuReST tracker and runs on the eye's region of interest (ROI)
-// of the full-resolution frame. Nothing is re-encoded or resized before
-// PuReST sees it, so diameters are in source-frame pixels.
+// owns its own Soft Flow tracker on a bounded eye ROI (longest side 320 px).
+// Ellipses are mapped back to source-frame pixels before reporting.
 //
 // Two modes share the same worker code:
 //
@@ -18,8 +17,9 @@
 //            eye ever falls behind, the oldest queued frame for that eye is
 //            dropped and reported ("D" line) instead of delaying the camera.
 //
-// ROIs are normalised (x,y,w,h in 0..1 of the frame), so they work for any
-// camera resolution:  --roi-left 0,0,0.5,1  --roi-right 0.5,0,0.5,1
+// Automatic mode localizes a face/eye pair once before dispatching each frame.
+// Explicit normalised ROIs are used only with --eye-mode fixed:
+//   --roi-left 0,0,0.5,1 --roi-right 0.5,0,0.5,1
 //
 // stdin frame record (little-endian), stream mode:
 //   char[4] magic "PLR1" | u32 flags | u64 seq | i64 timestamp_ns
@@ -28,7 +28,8 @@
 //
 // stdout lines, stream mode:
 //   READY <version>
-//   P <eye> <seq> <ts> <valid> <conf> <outline_conf> <major> <minor> <cx> <cy> <angle> <proc_us>
+//   P <eye> <seq> <ts> <valid> <conf> <outline_conf> <major> <minor> <cx> <cy> <angle> <proc_us> <source> <estimated> <visibility>
+//     <eye_x> <eye_y> <eye_width> <eye_height> <localization> <localization_us>
 //   D <eye> <seq> <ts>
 //   BYE <frames>
 //
@@ -60,9 +61,10 @@
 #include <thread>
 #include <vector>
 
-#include "PuReST.h"
+#include "soft_flow.hpp"
+#include "eye_locator.hpp"
 
-#define PLR_PUREST_VERSION "2.0.0"
+#define PLR_PUREST_VERSION "2.2.0-softflow-lite-eyes"
 
 namespace {
 
@@ -80,6 +82,9 @@ struct Options {
     float max_pupil_mm = -1.0f;
     float min_pupil_px = -1.0f;   // pixel limits win over the mm assumptions
     float max_pupil_px = -1.0f;
+    plr::SoftFlowConfig recovery;
+    plr::EyeLocatorConfig localization;
+    Options() { localization.cascade_dir = PLR_CASCADE_DIR; }
     long max_frames = -1;
     int progress_every = 0;
     size_t queue_depth = 6;
@@ -90,7 +95,7 @@ const char *EYE_NAME[2] = {"left", "right"};
 
 void usage(const char *argv0) {
     std::cerr
-        << "plr_purest " << PLR_PUREST_VERSION << " - PuReST on both eyes in parallel\n"
+        << "plr_purest " << PLR_PUREST_VERSION << " - PuReST Soft Flow Lite on both eyes in parallel\n"
         << "offline: " << argv0 << " --input VIDEO --out-left L.csv --out-right R.csv [options]\n"
         << "stream : " << argv0 << " --stream [options]   (frames on stdin, results on stdout)\n"
         << "  --roi-left x,y,w,h        normalised left-eye ROI  (default 0,0,0.5,1)\n"
@@ -99,6 +104,18 @@ void usage(const char *argv0) {
         << "  --max-pupil-mm F          PuRe maximum pupil diameter assumption (default 8)\n"
         << "  --min-pupil-px F          smallest pupil diameter to accept, in frame pixels\n"
         << "  --max-pupil-px F          largest pupil diameter to accept, in frame pixels\n"
+        << "  --eye-mode auto|fixed     face/eye boxes (default auto), or explicit eye ROIs\n"
+        << "  --swap-eyes               swap anatomical eye labels (mirrored camera)\n"
+        << "  --eye-interval N          cascade search every N frames (default 6)\n"
+        << "  --eye-ttl-ms F            expire undetected eye boxes (default 500)\n"
+        << "  --cascade-dir DIR         directory containing the bundled Haar cascades\n"
+        << "  --work-size N             longest processed eye side (64..640, default 320)\n"
+        << "  --flow-frames N           max flow-only estimates (0..5, default 3)\n"
+        << "  --max-gap-ms F            temporal reset and flow horizon (default 150)\n"
+        << "  --reacquire-every N       full-eye soft search interval (default 3)\n"
+        << "  --min-contrast F          pupil/ring grayscale contrast (default 12)\n"
+        << "  --confidence F            observed ellipse confidence gate (default .70)\n"
+        << "  --glint-kernel N          odd median size 3..15 (default 11); 0 disables\n"
         << "  --max-frames N            offline: stop after N frames (testing)\n"
         << "  --progress N              offline: 'progress <frames>' on stderr every N frames\n"
         << "  --queue-depth N           stream: frames buffered per eye before dropping (default 6)\n";
@@ -141,6 +158,22 @@ bool parse(int argc, char **argv, Options &opt) {
         else if (arg == "--max-pupil-mm") opt.max_pupil_mm = std::strtof(next("--max-pupil-mm").c_str(), nullptr);
         else if (arg == "--min-pupil-px") opt.min_pupil_px = std::strtof(next("--min-pupil-px").c_str(), nullptr);
         else if (arg == "--max-pupil-px") opt.max_pupil_px = std::strtof(next("--max-pupil-px").c_str(), nullptr);
+        else if (arg == "--eye-mode") {
+            const auto mode = next("--eye-mode");
+            if (mode != "auto" && mode != "fixed") return false;
+            opt.localization.automatic = mode == "auto";
+        }
+        else if (arg == "--swap-eyes") opt.localization.swap_eyes = true;
+        else if (arg == "--eye-interval") opt.localization.interval = std::atoi(next("--eye-interval").c_str());
+        else if (arg == "--eye-ttl-ms") opt.localization.ttl_ms = std::strtof(next("--eye-ttl-ms").c_str(), nullptr);
+        else if (arg == "--cascade-dir") opt.localization.cascade_dir = next("--cascade-dir");
+        else if (arg == "--work-size") opt.recovery.work_size = std::atoi(next("--work-size").c_str());
+        else if (arg == "--flow-frames") opt.recovery.flow_frames = std::atoi(next("--flow-frames").c_str());
+        else if (arg == "--max-gap-ms") opt.recovery.max_gap_ms = std::strtof(next("--max-gap-ms").c_str(), nullptr);
+        else if (arg == "--reacquire-every") opt.recovery.reacquire_every = std::atoi(next("--reacquire-every").c_str());
+        else if (arg == "--min-contrast") opt.recovery.min_contrast = std::strtof(next("--min-contrast").c_str(), nullptr);
+        else if (arg == "--confidence") opt.recovery.confidence = std::strtof(next("--confidence").c_str(), nullptr);
+        else if (arg == "--glint-kernel") opt.recovery.glint_kernel = std::atoi(next("--glint-kernel").c_str());
         else if (arg == "--max-frames") opt.max_frames = std::strtol(next("--max-frames").c_str(), nullptr, 10);
         else if (arg == "--progress") opt.progress_every = std::atoi(next("--progress").c_str());
         else if (arg == "--queue-depth") opt.queue_depth = std::max(1, std::atoi(next("--queue-depth").c_str()));
@@ -151,6 +184,21 @@ bool parse(int argc, char **argv, Options &opt) {
             std::cerr << "unknown argument: " << arg << "\n";
             return false;
         }
+    }
+    const auto &r = opt.recovery;
+    if (r.work_size < 64 || r.work_size > 640 || r.flow_frames < 0 || r.flow_frames > 5 ||
+        r.reacquire_every < 1 || r.reacquire_every > 30 || !std::isfinite(r.max_gap_ms) ||
+        r.max_gap_ms < 10 || r.max_gap_ms > 500 || !std::isfinite(r.min_contrast) ||
+        r.min_contrast < 1 || r.min_contrast > 100 || !std::isfinite(r.confidence) ||
+        r.confidence < 0 || r.confidence > 1 ||
+        (r.glint_kernel != 0 && (r.glint_kernel < 3 || r.glint_kernel > 15 || r.glint_kernel % 2 == 0))) {
+        std::cerr << "invalid Soft Flow options\n";
+        return false;
+    }
+    if (opt.localization.interval < 1 || opt.localization.interval > 60 ||
+        !std::isfinite(opt.localization.ttl_ms) || opt.localization.ttl_ms < 50 || opt.localization.ttl_ms > 2000) {
+        std::cerr << "invalid eye localization options\n";
+        return false;
     }
     if (opt.stream) return true;
     return !(opt.input.empty() || opt.out_left.empty() || opt.out_right.empty());
@@ -172,6 +220,7 @@ struct Job {
     uint64_t seq = 0;
     int64_t ts = 0;
     bool reset = false;
+    plr::EyeRegions regions;
 };
 
 class EyeQueue {
@@ -237,28 +286,26 @@ struct Result {
     float confidence = 0, outline_confidence = 0;
     float major = NAN, minor = NAN, cx = NAN, cy = NAN, angle = NAN;
     long proc_us = 0;
+    std::string source = "missing", visibility = "uncertain";
+    bool estimated = false;
+    cv::Rect roi;
+    std::string localization = "missing";
+    long localization_us = 0;
 };
 
 class EyeWorker {
 public:
     EyeWorker(int eye, const Options &opt, std::function<void(const Result &)> sink)
-        : eye_(eye), roi_(opt.roi[eye]), queue_(opt.queue_depth), sink_(std::move(sink)),
-          load_us_(opt.simulate_load_us), min_px_(opt.min_pupil_px), max_px_(opt.max_pupil_px) {
-        if (opt.min_pupil_mm > 0) tracker_.minPupilDiameterMM = opt.min_pupil_mm;
-        if (opt.max_pupil_mm > 0) tracker_.maxPupilDiameterMM = opt.max_pupil_mm;
-    }
+        : eye_(eye), tracker_(recovery_config(opt)),
+          queue_(opt.queue_depth), sink_(std::move(sink)), load_us_(opt.simulate_load_us) {}
 
-    // PuRe derives its pixel limits from the image diagonal d:
-    //   max_px = d * maxMM / canthi_mm,   min_px = (2/3) d * minMM / canthi_mm
-    // (scale-invariant, also inside PuReST tracking). Invert that so pixel
-    // limits in frame pixels can be set for the current ROI size.
-    void apply_pixel_limits(const cv::Size &roi) {
-        if (roi == limits_for_ || (min_px_ <= 0 && max_px_ <= 0)) return;
-        limits_for_ = roi;
-        const float d = std::sqrt(static_cast<float>(roi.width) * roi.width + static_cast<float>(roi.height) * roi.height);
-        const float canthi = tracker_.meanCanthiDistanceMM;
-        if (max_px_ > 0) tracker_.maxPupilDiameterMM = max_px_ * canthi / d;
-        if (min_px_ > 0) tracker_.minPupilDiameterMM = min_px_ * canthi * 1.5f / d;
+    static plr::SoftFlowConfig recovery_config(const Options &opt) {
+        auto config = opt.recovery;
+        config.min_px = opt.min_pupil_px;
+        config.max_px = opt.max_pupil_px;
+        config.min_mm = opt.min_pupil_mm;
+        config.max_mm = opt.max_pupil_mm;
+        return config;
     }
 
     void start() { thread_ = std::thread([this] { loop(); }); }
@@ -278,23 +325,25 @@ private:
             if (job.reset) tracker_.reset();
             if (load_us_ > 0) std::this_thread::sleep_for(std::chrono::microseconds(load_us_));
             const cv::Mat &frame = *job.frame;
-            const cv::Rect roi = pixel_roi(roi_, frame.cols, frame.rows);
+            const cv::Rect roi = job.regions.eye[eye_];
+            r.roi = roi;
+            r.localization = job.regions.source;
+            r.localization_us = job.regions.processing_us;
+            if (roi != previous_roi_) tracker_.reset();
+            previous_roi_ = roi;
             if (roi.width >= 16 && roi.height >= 16) {
-                apply_pixel_limits(roi.size());
-                const cv::Mat view = frame(roi);  // no copy, no resize
-                Pupil pupil;
-                tracker_.run(view, pupil);
-                const bool outline = pupil.size.width > 0 && pupil.size.height > 0 &&
-                                     pupil.center.x > 0 && pupil.center.y > 0;
+                const auto detection = tracker_.run(frame(roi), job.seq, job.ts);
+                const auto &pupil = detection.pupil;
                 r.confidence = pupil.confidence;
                 r.outline_confidence = pupil.outline_confidence;
-                r.valid = outline && pupil.confidence > 0.0f;
-                if (r.valid && max_px_ > 0 && std::max(pupil.size.width, pupil.size.height) > max_px_ * 1.15f)
-                    r.valid = false;   // outline far larger than any pupil (e.g. the iris)
-                if (outline) {
+                r.valid = detection.valid;
+                r.source = detection.source;
+                r.estimated = detection.estimated;
+                r.visibility = detection.visibility;
+                if (pupil.hasOutline()) {
                     r.major = std::max(pupil.size.width, pupil.size.height);
                     r.minor = std::min(pupil.size.width, pupil.size.height);
-                    r.cx = pupil.center.x + roi.x;   // full-frame coordinates
+                    r.cx = pupil.center.x + roi.x;
                     r.cy = pupil.center.y + roi.y;
                     r.angle = pupil.angle;
                 }
@@ -307,13 +356,11 @@ private:
     }
 
     int eye_;
-    NormRoi roi_;
-    PuReST tracker_;
+    cv::Rect previous_roi_;
+    plr::SoftFlow tracker_;
     EyeQueue queue_;
     std::function<void(const Result &)> sink_;
     long load_us_;
-    float min_px_, max_px_;
-    cv::Size limits_for_{0, 0};
     std::thread thread_;
 };
 
@@ -344,7 +391,7 @@ int run_offline(const Options &opt) {
             return 4;
         }
         out[e] << "Frame,Valid,Confidence,Outline_confidence,Diameter_px,Minor_px,"
-                  "Center_x,Center_y,Angle_deg,Proc_us\n";
+                  "Center_x,Center_y,Angle_deg,Proc_us,Source,Estimated,Visibility,Eye_x,Eye_y,Eye_width,Eye_height,Localization,Localization_us,Timestamp_ns\n";
     }
     // Each eye writes only its own file, from its own thread: no lock needed.
     auto sink = [&](const Result &r) {
@@ -355,17 +402,21 @@ int run_offline(const Options &opt) {
             o << fmt(r.major) << ',' << fmt(r.minor) << ',' << fmt(r.cx) << ',' << fmt(r.cy) << ',' << fmt(r.angle);
         else
             o << ",,,,";
-        o << ',' << r.proc_us << '\n';
+        o << ',' << r.proc_us << ',' << r.source << ',' << (r.estimated ? 1 : 0) << ',' << r.visibility << ',' << r.roi.x << ',' << r.roi.y << ',' << r.roi.width << ',' << r.roi.height << ',' << r.localization << ',' << r.localization_us << ',' << r.ts << '\n';
     };
     Options offline = opt;
     offline.queue_depth = 8;
     EyeWorker left(0, offline, sink), right(1, offline, sink);
+    plr::EyeLocator locator(opt.localization);
     left.start();
     right.start();
 
     const auto started = std::chrono::steady_clock::now();
     cv::Mat frame;
     uint64_t index = 0;
+    const double fps = cap.get(cv::CAP_PROP_FPS);
+    const double period_ns = 1e9 / (fps > 0 && std::isfinite(fps) ? fps : 30.0);
+    int64_t previous_ts = -1;
     while (cap.read(frame)) {
         if (opt.max_frames >= 0 && static_cast<long>(index) >= opt.max_frames) break;
         auto grey = std::make_shared<cv::Mat>();
@@ -375,8 +426,18 @@ int run_offline(const Options &opt) {
         Job job;
         job.frame = grey;
         job.seq = index;
-        job.ts = 0;
+        job.ts = static_cast<int64_t>(std::llround(index * period_ns));
+        const double pts_ms = cap.get(cv::CAP_PROP_POS_MSEC);
+        if (std::isfinite(pts_ms) && pts_ms >= 0 && (index == 0 || pts_ms * 1e6 > previous_ts))
+            job.ts = static_cast<int64_t>(std::llround(pts_ms * 1e6));
+        if (job.ts <= previous_ts) job.ts = previous_ts + static_cast<int64_t>(std::llround(period_ns));
+        previous_ts = job.ts;
         job.reset = index == 0;
+        if (opt.localization.automatic) job.regions = locator.locate(*grey, job.seq, job.ts, job.reset);
+        else {
+            for (int e = 0; e < 2; ++e) job.regions.eye[e] = pixel_roi(opt.roi[e], grey->cols, grey->rows);
+            job.regions.source = "fixed";
+        }
         left.queue().push_blocking(job);
         right.queue().push_blocking(job);
         ++index;
@@ -439,11 +500,12 @@ int run_stream(const Options &opt) {
         s << "P " << EYE_NAME[r.eye] << ' ' << r.seq << ' ' << r.ts << ' ' << (r.valid ? 1 : 0) << ' '
           << fmt(r.confidence) << ' ' << fmt(r.outline_confidence) << ' ' << fmt(r.major) << ' '
           << fmt(r.minor) << ' ' << fmt(r.cx) << ' ' << fmt(r.cy) << ' ' << fmt(r.angle) << ' '
-          << r.proc_us << '\n';
+          << r.proc_us << ' ' << r.source << ' ' << (r.estimated ? 1 : 0) << ' ' << r.visibility << ' ' << r.roi.x << ' ' << r.roi.y << ' ' << r.roi.width << ' ' << r.roi.height << ' ' << r.localization << ' ' << r.localization_us << '\n';
         emit(s.str());
     };
     EyeWorker left(0, opt, sink), right(1, opt, sink);
     EyeWorker *workers[2] = {&left, &right};
+    plr::EyeLocator locator(opt.localization);
     left.start();
     right.start();
     emit(std::string("READY ") + PLR_PUREST_VERSION + "\n");
@@ -472,6 +534,11 @@ int run_stream(const Options &opt) {
         job.seq = seq;
         job.ts = ts;
         job.reset = (flags & 1u) != 0;
+        if (opt.localization.automatic) job.regions = locator.locate(*grey, job.seq, job.ts, job.reset);
+        else {
+            for (int e = 0; e < 2; ++e) job.regions.eye[e] = pixel_roi(opt.roi[e], grey->cols, grey->rows);
+            job.regions.source = "fixed";
+        }
         for (int e = 0; e < 2; ++e) {
             Job dropped;
             if (workers[e]->queue().push_dropping(job, dropped)) {
@@ -499,5 +566,9 @@ int main(int argc, char **argv) {
     // Each eye already has its own thread; stop OpenCV from also spreading
     // every call over all cores, which would make the two eyes fight.
     cv::setNumThreads(1);
-    return opt.stream ? run_stream(opt) : run_offline(opt);
+    try { return opt.stream ? run_stream(opt) : run_offline(opt); }
+    catch (const std::exception &e) {
+        std::cerr << "tracker error: " << e.what() << "\n";
+        return 8;
+    }
 }

@@ -4,6 +4,7 @@ native/purest/build/
 __pycache__/
 *.pyc
 .pytest_cache/
+outputs/
 
 # per-rig data: never committed
 sessions/

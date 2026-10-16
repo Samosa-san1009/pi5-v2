@@ -83,8 +83,12 @@ def build_results(session_dir: Path, session_id: str, traces: dict, source: str,
 
     roi_px = {eye: _roi_px(settings["eye_roi"][eye], width, height) for eye in ("left", "right")}
     analyzer_config = {
-        eye: {"analyzer": "purest", "eye": eye, "source": source, "roi_px": roi_px[eye],
-              "roi_normalised": settings["eye_roi"][eye],
+        eye: {"analyzer": "purest", "eye": eye, "source": source,
+              "roi_px": roi_px[eye] if settings.get("eye_localization", {}).get("mode", "fixed") == "fixed" else None,
+              "variant": "softflow_lite", "flow_estimates_in_metrics": False,
+              "eye_localization": settings.get("eye_localization", {"mode": "fixed"}),
+              "roi_normalised": settings["eye_roi"][eye] if settings.get("eye_localization", {}).get("mode", "fixed") == "fixed" else None,
+              "roi_definition": "tracking.eye_box for each frame" if settings.get("eye_localization", {}).get("mode") == "auto" else "fixed eye_roi",
               "confidence_threshold": settings["purest"]["confidence_threshold"],
               "coverage": (traces.get(eye) or {}).get("coverage")}
         for eye in ("left", "right")
@@ -167,9 +171,23 @@ def _trace_output(trace, times, fps, config):
             "confidence": round(float(c), 4) if np.isfinite(c) else None,
             "valid": valid,
         })
+    tracking = []
+    estimates = trace.get("estimate_px", np.full(n, np.nan))
+    sources = trace.get("tracking_source", ["purest"] * n)
+    estimated = trace.get("estimated", [False] * n)
+    visibility = trace.get("visibility", ["unknown"] * n)
+    eye_boxes = trace.get("eye_boxes", np.zeros((n, 4), dtype=int))
+    localization = trace.get("localization", ["fixed"] * n)
+    for i in range(n):
+        estimate = estimates[i]
+        tracking.append({"frame": i, "source": str(sources[i]),
+                         "estimated": bool(estimated[i]),
+                         "visibility": str(visibility[i]),
+                         "eye_box": [int(v) for v in eye_boxes[i]], "localization": str(localization[i]),
+                         "estimate_px": round(float(estimate), 4) if np.isfinite(estimate) else None})
     return {"fps": round(float(fps), 6), "time_base": "sensor_timestamps" if len(times) else "nominal_fps",
             "analyzer": "purest", "analyzer_config": config, "coverage": trace.get("coverage"),
-            "samples": samples}
+            "samples": samples, "tracking": tracking}
 
 
 def _roi_px(roi, width, height):

@@ -41,6 +41,9 @@
 
 #include <opencv2/core/mat.hpp>
 #include <opencv2/imgproc.hpp>
+#if CV_VERSION_MAJOR >= 5
+#include <opencv2/geometry/2d.hpp>
+#endif
 #include <map>
 #include <bitset>
 #include "PupilDetectionMethod.h"

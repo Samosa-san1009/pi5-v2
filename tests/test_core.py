@@ -50,6 +50,17 @@ def test_wiring_doc_matches_defaults():
     {"eye_roi": {"left": [0.6, 0, 0.5, 1]}},  # outside the frame
     {"purest": {"report": "sometimes"}},
     {"purest": {"live": False, "offline": False}},
+    {"purest": {"work_size": 1000}},
+    {"purest": {"flow_frames": 6}},
+    {"purest": {"reacquire_every": 0}},
+    {"purest": {"work_size": 320.5}},
+    {"purest": {"min_contrast": 0}},
+    {"purest": {"max_gap_ms": float("nan")}},
+    {"purest": {"glint_kernel": 8}},
+    {"eye_localization": {"mode": "guess"}},
+    {"eye_localization": {"interval": 1.5}},
+    {"eye_localization": {"ttl_ms": float("nan")}},
+    {"eye_localization": {"swap_eyes": "yes"}},
     {"endstops": {"right": {"gpio": 18}}},   # left LED
     {"leds": {"left": {"power_pct": 150}}},
 ])

@@ -159,8 +159,17 @@ class TftDisplay:
 
         if self.settings.get("show_rois", True):
             for eye, color in (("left", (37, 99, 235)), ("right", (220, 38, 38))):
-                x, y, w, h = self.eye_roi[eye]
-                draw.rectangle((x * width, y * height, (x + w) * width - 1, (y + h) * height - 1), outline=color)
+                automatic = self.live is not None and self.live.settings.get("eye_localization", {}).get("mode") == "auto"
+                if automatic:
+                    sample = self.live.latest.get(eye)
+                    box = (sample or {}).get("eye_box")
+                    if not box or now - sample["at"] > .6 or box[2] <= 0:
+                        continue
+                    x, y, w, h = box
+                    draw.rectangle((x * sx, y * sy, (x + w) * sx - 1, (y + h) * sy - 1), outline=color)
+                else:
+                    x, y, w, h = self.eye_roi[eye]
+                    draw.rectangle((x * width, y * height, (x + w) * width - 1, (y + h) * height - 1), outline=color)
         if self.settings.get("show_pupils", True) and self.live is not None:
             for eye in ("left", "right"):
                 sample = self.live.latest.get(eye)
@@ -171,8 +180,9 @@ class TftDisplay:
                     r = max(2.0, 0.5 * sample["major"] * sx)
                     draw.ellipse((cx - r, cy - r, cx + r, cy + r), outline=(0, 255, 0), width=2)
                 else:
-                    x, y, w, _h = self.eye_roi[eye]
-                    draw.text(((x + w / 2) * width - 12, 18), "lost", fill=(255, 60, 60))
+                    box = sample.get("eye_box")
+                    text_x = (box[0] + box[2] / 2) * sx - 12 if box and box[2] else (6 if eye == "left" else width - 32)
+                    draw.text((text_x, 18), "lost", fill=(255, 60, 60))
 
         state = self.state_provider() or {}
         stage = str(state.get("stage", "idle")).upper()

@@ -410,7 +410,7 @@ def health():
         },
         "purest": {"binary": purest.binary_status(), "live": RIG["live"].status()},
         "analyzers": {"purest": {"ready": purest.binary_status()["ready"],
-                                 "description": "PuReST, native C++, both eyes in parallel (live + offline)"}},
+                                 "description": "PuReST Soft Flow Lite, CPU-only C++, both eyes (live + offline)"}},
     })
 
 
@@ -508,7 +508,8 @@ def post_settings():
     except Exception as exc:
         return jsonify({"ok": False, "error": str(exc)}), 400
     applied, restart = [], []
-    live_changed = after["purest"] != before["purest"] or after["eye_roi"] != before["eye_roi"]
+    live_changed = (after["purest"] != before["purest"] or after["eye_roi"] != before["eye_roi"]
+                    or after["eye_localization"] != before["eye_localization"])
     if after["leds"] != before["leds"] or live_changed:
         if SESSION_LOCK.acquire(blocking=False):
             try:
@@ -517,7 +518,7 @@ def post_settings():
                     applied.append("leds")
                 if live_changed:
                     rebuild_live_engine(after)
-                    applied.append("purest/eye_roi")
+                    applied.append("purest/eye_roi/eye_localization")
             finally:
                 SESSION_LOCK.release()
         else:
@@ -539,6 +540,7 @@ def reset_settings():
 def purest_status():
     return jsonify({"binary": purest.binary_status(), "live": RIG["live"].status(),
                     "settings": SETTINGS.section("purest"), "eye_roi": SETTINGS.section("eye_roi"),
+                    "eye_localization": SETTINGS.section("eye_localization"),
                     "background": BACKGROUND.get("info")})
 
 

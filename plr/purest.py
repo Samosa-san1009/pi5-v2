@@ -1,11 +1,11 @@
-"""PuReST on both eyes in parallel, live and offline.
+"""CPU-only PuReST Soft Flow Lite on both eyes, live and offline.
 
 Both modes use the one native program, native/purest/build/plr_purest, which
 runs a separate PuReST tracker per eye on its own thread (one CPU core each).
 
 LiveEngine   A persistent `plr_purest --stream` process. While a session
              records, the camera hands it every uncompressed frame; results
-             for both eyes come back within a few milliseconds. Between
+             for both eyes come back asynchronously. Between
              sessions it is fed at a low rate so the TFT can show the pupils
              while the rig is lined up. It never blocks the camera: if it
              ever falls behind, frames are dropped and reported, and the
@@ -58,6 +58,17 @@ def _engine_args(settings: dict) -> list[str]:
         args += ["--min-pupil-px", str(purest["min_pupil_px"])]
     if purest.get("max_pupil_px"):
         args += ["--max-pupil-px", str(purest["max_pupil_px"])]
+    for key, default in (("work_size", 320), ("flow_frames", 3), ("max_gap_ms", 150),
+                         ("reacquire_every", 3), ("min_contrast", 12), ("glint_kernel", 11)):
+        args += ["--" + key.replace("_", "-"), str(purest.get(key, default))]
+    args += ["--confidence", str(purest.get("confidence_threshold", .70))]
+    localization = settings.get("eye_localization", {"mode": "fixed"})
+    args += ["--eye-mode", localization.get("mode", "auto"),
+             "--eye-interval", str(localization.get("interval", 6)),
+             "--eye-ttl-ms", str(localization.get("ttl_ms", 500)),
+             "--cascade-dir", str(REPO_ROOT / "native" / "purest" / "models")]
+    if localization.get("swap_eyes"):
+        args += ["--swap-eyes"]
     return args
 
 
@@ -107,6 +118,7 @@ class LiveEngine:
         self.restarts = 0
         self._last_start = 0.0
         self._stats = {eye: collections.deque(maxlen=300) for eye in EYES}
+        self._localization_stats = collections.deque(maxlen=300)
         self._drops = {eye: 0 for eye in EYES}
         self._python_drops = 0
         self._feeder = None
@@ -235,7 +247,7 @@ class LiveEngine:
             if not parts:
                 continue
             kind = parts[0]
-            if kind == "P" and len(parts) == 13:
+            if kind == "P" and len(parts) in (13, 16, 22):
                 eye, seq, ts = parts[1], int(parts[2]), int(parts[3])
                 sample = {
                     "seq": seq, "ts": ts, "valid": parts[4] == "1",
@@ -243,9 +255,17 @@ class LiveEngine:
                     "major": _num(parts[7]), "minor": _num(parts[8]),
                     "cx": _num(parts[9]), "cy": _num(parts[10]), "angle": _num(parts[11]),
                     "proc_us": int(parts[12]), "at": time.monotonic(),
+                    "source": parts[13] if len(parts) >= 16 else "purest",
+                    "estimated": len(parts) >= 16 and parts[14] == "1",
+                    "visibility": parts[15] if len(parts) >= 16 else "unknown",
+                    "eye_box": [int(v) for v in parts[16:20]] if len(parts) == 22 else None,
+                    "localization": parts[20] if len(parts) == 22 else "fixed",
+                    "localization_us": int(parts[21]) if len(parts) == 22 else 0,
                 }
                 self.latest[eye] = sample
                 self._stats[eye].append(sample["proc_us"])
+                if eye == "left":
+                    self._localization_stats.append(sample["localization_us"])
                 session = self._session
                 if session is not None and seq in session["submitted"]:
                     session["results"][eye][seq] = sample
@@ -310,11 +330,15 @@ class LiveEngine:
 
         return {
             "enabled": self.enabled,
+            "variant": "softflow_lite",
+            "eye_localization": self.settings.get("eye_localization", {"mode": "fixed"}),
+            "eye_boxes": {e: (self.latest[e] or {}).get("eye_box") for e in EYES},
             "running": self.ready,
             "error": self.error,
             "restarts": self.restarts,
             "recording": self._session is not None,
             "processing_time": {eye: summary(self._stats[eye]) for eye in EYES},
+            "localization_time": summary(self._localization_stats),
             "dropped_frames": {**self._drops, "before_engine": self._python_drops},
             "binary": str(binary_path()),
         }
@@ -335,7 +359,10 @@ def live_traces(collected: dict, frame_ts: list[int], threshold: float) -> dict:
                 continue
             matched += 1
             _fill(trace, i, sample["valid"], sample["confidence"], sample["major"], sample["minor"],
-                  sample["cx"], sample["cy"], threshold)
+                  sample["cx"], sample["cy"], threshold, sample.get("source", "purest"),
+                  sample.get("estimated", False), sample.get("visibility", "unknown"))
+            trace["eye_boxes"][i] = sample.get("eye_box") or [0, 0, 0, 0]
+            trace["localization"][i] = sample.get("localization", "fixed")
         trace["analysed"] = matched
         trace["coverage"] = round(matched / n, 4) if n else 0.0
         out[eye] = trace
@@ -371,7 +398,8 @@ def run_offline(video: str | Path, work_dir: str | Path, settings: dict, frame_c
                 proc.terminate()
                 return
 
-    threading.Thread(target=watch_cancel, daemon=True).start()
+    if cancel is not None:
+        threading.Thread(target=watch_cancel, daemon=True).start()
     for line in proc.stderr:
         line = line.strip()
         if line.startswith("total "):
@@ -405,7 +433,10 @@ def read_csv_trace(path: Path, frame_count: int, threshold: float) -> dict:
             continue
         _fill(trace, i, row["Valid"] == "1", _num(row["Confidence"]), _num(row["Diameter_px"] or "nan"),
               _num(row["Minor_px"] or "nan"), _num(row["Center_x"] or "nan"), _num(row["Center_y"] or "nan"),
-              threshold)
+              threshold, row.get("Source", "purest"), row.get("Estimated") == "1",
+              row.get("Visibility", "unknown"))
+        trace["eye_boxes"][i] = [int(row.get(k, 0)) for k in ("Eye_x", "Eye_y", "Eye_width", "Eye_height")]
+        trace["localization"][i] = row.get("Localization", "fixed")
     trace["analysed"] = len(rows)
     trace["coverage"] = round(min(len(rows), n) / n, 4) if n else 0.0
     return trace
@@ -417,12 +448,22 @@ def _empty_trace(n: int) -> dict:
     nan = np.full(n, np.nan)
     return {"diameter_px": nan.copy(), "minor_px": nan.copy(), "confidence": nan.copy(),
             "center_x": nan.copy(), "center_y": nan.copy(), "valid": np.zeros(n, bool),
+            "tracking_source": np.full(n, "missing", dtype=object),
+            "estimated": np.zeros(n, bool), "estimate_px": nan.copy(),
+            "visibility": np.full(n, "unknown", dtype=object),
+            "eye_boxes": np.zeros((n, 4), dtype=int), "localization": np.full(n, "missing", dtype=object),
             "analysed": 0, "coverage": 0.0}
 
 
-def _fill(trace, i, valid, confidence, major, minor, cx, cy, threshold):
+def _fill(trace, i, valid, confidence, major, minor, cx, cy, threshold,
+          source="purest", estimated=False, visibility="unknown"):
+    trace["tracking_source"][i] = source
+    trace["estimated"][i] = estimated
+    trace["visibility"][i] = visibility
+    if estimated and math.isfinite(major):
+        trace["estimate_px"][i] = major
     trace["confidence"][i] = confidence if math.isfinite(confidence) else 0.0
-    ok = bool(valid) and math.isfinite(major) and (confidence if math.isfinite(confidence) else 0.0) >= threshold
+    ok = bool(valid) and not estimated and math.isfinite(major) and (confidence if math.isfinite(confidence) else 0.0) >= threshold
     trace["valid"][i] = ok
     if ok:
         trace["diameter_px"][i] = major

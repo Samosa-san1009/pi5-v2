@@ -117,6 +117,13 @@ DEFAULTS: dict = {
         "live_nice": 0,
         "offline_nice": 10,
         "confidence_threshold": 0.70,
+        # CPU-only Soft Flow: bounded grayscale recovery and sparse LK.
+        "work_size": 320,
+        "flow_frames": 3,
+        "max_gap_ms": 150,
+        "reacquire_every": 3,
+        "min_contrast": 12,
+        "glint_kernel": 11,
         # Pupil size limits in camera pixels (the unit the app shows). Leave
         # None at first. If a session shows the trace jumping to the iris
         # size, set max_pupil_px a little above the largest real pupil
@@ -131,6 +138,12 @@ DEFAULTS: dict = {
     "eye_roi": {
         "left": [0.0, 0.0, 0.5, 1.0],
         "right": [0.5, 0.0, 0.5, 1.0],
+    },
+    "eye_localization": {
+        "mode": "auto",  # face -> eye pair -> bounded pupil crops
+        "swap_eyes": False,  # anatomical left is screen-right unless mirrored
+        "interval": 6,
+        "ttl_ms": 500,
     },
     "session": {
         "pre_roll_s": 1.0,
@@ -220,6 +233,15 @@ def validate(settings: dict) -> dict:
     _clamp(settings["camera"]["fps"], 1, 120, "camera.fps")
 
     purest = settings["purest"]
+    localization = settings["eye_localization"]
+    if localization["mode"] not in {"auto", "fixed"}:
+        raise ValueError("eye_localization.mode must be auto or fixed")
+    interval = _clamp(localization["interval"], 1, 60, "eye_localization.interval")
+    if int(interval) != interval:
+        raise ValueError("eye_localization.interval must be an integer")
+    if not isinstance(localization["swap_eyes"], bool):
+        raise ValueError("eye_localization.swap_eyes must be boolean")
+    _clamp(localization["ttl_ms"], 50, 2000, "eye_localization.ttl_ms")
     if purest["report"] not in {"auto", "live", "offline"}:
         raise ValueError("purest.report must be auto, live or offline")
     if not (purest["live"] or purest["offline"]):
@@ -228,6 +250,16 @@ def validate(settings: dict) -> dict:
     _clamp(purest["idle_preview_fps"], 0, 30, "purest.idle_preview_fps")
     _clamp(purest["confidence_threshold"], 0, 1, "purest.confidence_threshold")
     _clamp(purest["queue_depth"], 1, 120, "purest.queue_depth")
+    for key, low, high in (("work_size", 64, 640), ("flow_frames", 0, 5),
+                           ("reacquire_every", 1, 30)):
+        value = _clamp(purest[key], low, high, f"purest.{key}")
+        if int(value) != value:
+            raise ValueError(f"purest.{key} must be an integer")
+    _clamp(purest["max_gap_ms"], 10, 500, "purest.max_gap_ms")
+    _clamp(purest["min_contrast"], 1, 100, "purest.min_contrast")
+    kernel = purest["glint_kernel"]
+    if not isinstance(kernel, int) or (kernel != 0 and (kernel < 3 or kernel > 15 or kernel % 2 == 0)):
+        raise ValueError("purest.glint_kernel must be 0 or an odd integer from 3 to 15")
     for key in ("min_pupil_px", "max_pupil_px"):
         if purest.get(key) is not None:
             _clamp(purest[key], 2, 2000, f"purest.{key}")

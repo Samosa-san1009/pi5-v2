@@ -1,0 +1,4 @@
+# Optional desktop tools/analyze_video.py; not needed by the Pi server/native tracker.
+numpy>=1.24
+matplotlib>=3.7
+opencv-python-headless>=4.8

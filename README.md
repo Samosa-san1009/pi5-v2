@@ -3,11 +3,12 @@
 Pupillary light reflex (PLR) rig. The Pi 5 flashes a WS2812 LED into each
 eye, measures the true moment of every flash with two optical endstops,
 records both eyes with one IR camera (shown live on a small TFT), and tracks
-both pupils with **PuReST, natively in C++, on both eyes at the same time**.
+both pupils with **PuReST Soft Flow Lite, in C++, on both eyes at the same time**.
 The existing phone app starts sessions and shows the results. The app needs
 no changes: you only type the Pi's address into its "Pi server" field.
 
 * Wiring and every pin: [`docs/WIRING.md`](docs/WIRING.md)
+* Lightweight tracker, limits and Pi benchmark: [`docs/SOFT_FLOW_LITE.md`](docs/SOFT_FLOW_LITE.md)
 * What each file does: [File layout](#file-layout) at the end
 
 ## How PuReST runs (live + offline, both eyes in parallel)
@@ -31,8 +32,13 @@ camera ──► every uncompressed frame ──► plr_purest --stream ──�
 * Between sessions the live engine keeps tracking at 5 fps so the TFT shows
   the pupils while you line up the rig.
 
-PuReST is the only pupil model. If the app sends another `pupilAnalyzer`
-value (e.g. `resnet18`), it is accepted and PuReST is used.
+PuReST Soft Flow Lite is the only pupil analyzer. It adds grayscale recovery
+and bounded sparse optical flow, with no RITnet or neural segmentation. The
+full camera image is localized with lightweight face/eye cascades. Eye
+crops are processed at a maximum side of 320 px; reported diameters remain in
+camera pixels. Flow-only estimates are labeled separately and excluded from
+PLR metrics. If the app sends another `pupilAnalyzer` value (e.g. `resnet18`),
+it is accepted and this tracker is used.
 
 ---
 
@@ -189,12 +195,15 @@ or watch the TFT.
 2. **Screen orientation.** If the picture is upside down, set `rotate` to 2:
    `-d '{"display":{"rotate":2}}'`, then restart. Keep `width` 320 and
    `height` 240: other sizes leave part of the panel unwritten.
-3. **Eye boxes (ROIs).** The blue box must contain the eye the **left** LED
-   shines into, and the red box the eye the right LED shines into. Each box
-   should hold the whole eye with some margin. Values are fractions of the
-   picture `[x, y, width, height]`:
-   `-d '{"eye_roi":{"left":[0.05,0.15,0.4,0.7],"right":[0.55,0.15,0.4,0.7]}}'`
-   (applies immediately). If the eyes are swapped, swap the two boxes.
+3. **Automatic eye boxes.** The blue box tracks the subject's anatomical left
+   eye (screen-right on a non-mirrored camera); red tracks the right eye.
+   Check that these agree with the eyes illuminated by the corresponding LEDs.
+   For a mirrored camera or reversed rig labels, post
+   `-d '{"eye_localization":{"swap_eyes":true}}'` to `/settings`.
+   Detection tries a face/eye pair and searches directly for a matched eye pair
+   when the rig crops the forehead/chin. Lost eye boxes expire; frame halves are
+   never used as an automatic substitute. For an already cropped eye setup,
+   select `eye_localization.mode: "fixed"` and calibrate `eye_roi` manually.
 4. **Pupil tracking.** With someone at the rig, the TFT draws a green circle
    on each pupil. "lost" means PuReST cannot find it: check focus, IR
    illumination and the box.
@@ -205,7 +214,8 @@ or watch the TFT.
 6. **Balance the LEDs** if one eye's LED looks brighter:
    `-d '{"leds":{"left":{"power_pct":85}}}'`.
 7. **Check the live engine keeps up:** `curl -s localhost:5000/purest`.
-   `processing_time` per eye should be well below the frame time (33 ms at
+   Check both shared `localization_time` and per-eye `processing_time`, plus
+   `dropped_frames`. Pupil processing should be below the frame time (33 ms at
    30 fps), and `dropped_frames` should stay at 0.
 
 Settings are saved in `device_settings.json` (not in git, so `git pull`
@@ -279,8 +289,16 @@ Your settings and recorded sessions are kept.
 | `purest.cpus` | `[2, 3]` | cores for the two eye threads |
 | `purest.min_pupil_px` / `max_pupil_px` | none | pupil size limits in camera pixels |
 | `purest.confidence_threshold` | `0.70` | lower-confidence samples are marked invalid |
+| `purest.work_size` | `320` | maximum processed eye side; source-pixel output is preserved |
+| `purest.flow_frames` / `max_gap_ms` | `3` / `150` | bounded flow estimates; excluded from metrics |
+| `purest.reacquire_every` | `3` | full-eye grayscale recovery search interval |
+| `purest.min_contrast` | `12` | required pupil/ring grayscale contrast |
 | `purest.idle_preview_fps` | `5` | tracking rate between sessions (TFT circles); `0` = off |
-| `eye_roi.left` / `eye_roi.right` | halves | each eye's box in the picture |
+| `purest.glint_kernel` | `11` | bright reflection cleanup; `0` disables, otherwise odd 3–15 |
+| `eye_localization.mode` | `auto` | automatic face/eye boxes; `fixed` for calibrated crops |
+| `eye_localization.swap_eyes` | `false` | swap anatomical labels for mirrored/reversed rigs |
+| `eye_localization.interval` / `ttl_ms` | `6` / `500` | detection interval and expiry of undetected boxes |
+| `eye_roi.left` / `eye_roi.right` | halves | boxes used only in `fixed` mode |
 | `leds.<side>.gpio` / `power_pct` | 18 / 13, 100 | WS2812 pins and per-eye brightness |
 | `endstops.<side>.gpio` | 17 / 27 | endstop signal pins |
 | `camera.index`, `resolution`, `fps` | auto, 640×480, 30 | camera |
@@ -342,6 +360,9 @@ plr/
   analysis/plr_metrics.py    baseline, latency, MCA, MCV
 native/purest/
   src/plr_purest.cpp         PuReST engine: both eyes in parallel, --stream and --input modes
+  src/soft_flow.cpp          bounded grayscale recovery + sparse LK; no neural models
+  src/eye_locator.cpp        periodic face/eye cascades, tracked eye boxes, TTL
+  models/                    bundled OpenCV classifiers and their licenses
   third_party/...            PuRe / PuReST by Santini et al. (non-commercial licence)
 scripts/
   install.sh                 one-shot installer (safe to re-run)
@@ -359,3 +380,23 @@ docs/WIRING.md               full pin map and power bus
 PuRe and PuReST (Thiago Santini et al., `native/purest/third_party/`) are
 licensed for **non-commercial use only**. See the licence files there and
 cite the papers in publications.
+
+## Test a full-face recording
+
+After building the native engine, use the optional desktop analysis tools:
+
+```bash
+.venv/bin/pip install -r requirements-analysis.txt
+.venv/bin/python tools/analyze_video.py /path/to/full_video.mp4 --output outputs/sample
+```
+
+This exports `left.csv`, `right.csv`, `pupilogram.png`, `pupilogram.svg`,
+`summary.json`, and `overlay.mp4` with eye boxes and measured pupil circles.
+CSV/plots retain source presentation timestamps. The overlay is a nominal-fps
+review copy. Diameters are camera pixels; no millimetre calibration is assumed.
+Media stays in the ignored output folder. For synthetic mock-camera eyes,
+select `eye_localization.mode: "fixed"` before running a mock session.
+
+Validation: `ctest --test-dir native/purest/build --output-on-failure` and
+`python -m pytest tests -q`. Set `PLR_TEST_VIDEO=/path/full_video.mp4` to also
+exercise full-face localization, bilateral measurement and mirrored labels.

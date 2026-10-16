@@ -31,6 +31,7 @@ W, H = 640, 480
 def settings(**purest_overrides):
     s = copy.deepcopy(DEFAULTS)
     s["purest"]["cpus"] = []            # no pinning on a test machine
+    s["eye_localization"]["mode"] = "fixed"  # these fixtures are pre-cropped synthetic eyes
     s["purest"].update(purest_overrides)
     return s
 
@@ -82,19 +83,23 @@ def test_offline_tracks_both_eyes_every_frame(video, tmp_path, frames):
                                 frame_count=len(frames))
     for side in ("left", "right"):
         t = traces[side]
-        assert t["coverage"] == 1.0 and t["valid"].all()
+        assert t["coverage"] == 1.0 and t["valid"][1:].all()
+        assert not t["valid"][0]  # independent initial detection needs a second observation
         truth = np.array([2 * radius_at(i, side) for i in range(len(frames))])
         assert np.nanmedian(np.abs(t["diameter_px"] - truth)) < 1.5
         # full-frame coordinates: left pupil in the left half, right in the right half
         assert abs(np.nanmedian(t["center_x"]) - (W / 4 if side == "left" else 3 * W / 4)) < 2
 
 
-def _stream(frames, extra=()):
-    cmd = [str(purest.binary_path()), "--stream", *extra]
+def _stream(frames, extra=(), seqs=None, timestamps=None, resets=None):
+    cmd = [str(purest.binary_path()), "--stream", "--eye-mode", "fixed", *extra]
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     data = bytearray()
     for i, f in enumerate(frames):
-        data += purest._HEADER.pack(b"PLR1", 1 if i == 0 else 0, i, 1000 + i, W, H) + f.tobytes()
+        seq = seqs[i] if seqs is not None else i
+        ts = timestamps[i] if timestamps is not None else 1_000_000_000 + i * 33_333_333
+        reset = resets[i] if resets is not None else i == 0
+        data += purest._HEADER.pack(b"PLR1", int(reset), seq, ts, W, H) + f.tobytes()
     out, err = proc.communicate(bytes(data), timeout=60)
     return out.decode().splitlines(), proc.returncode
 
@@ -209,6 +214,9 @@ def test_results_have_the_shape_the_app_reads(tmp_path, frames):
     sample = pupilogram["eyes"]["left"]["samples"][0]
     assert set(sample) == {"frame", "time_s", "diameter_px", "confidence", "valid"}
     assert pupilogram["analyzer"] == "purest" and metrics["analysis_source"] == "live"
+    assert pupilogram["analyzer_config"]["left"]["variant"] == "softflow_lite"
+    assert len(pupilogram["eyes"]["left"]["tracking"]) == n
+    assert pupilogram["eyes"]["left"]["tracking"][0]["source"] == "purest"
     event = metrics["events"][0]
     assert event["stimulus"]["led_index"] == 1
     for key in ("direct", "consensual"):
@@ -233,3 +241,118 @@ def test_csv_threshold_marks_low_confidence_invalid(tmp_path):
     assert list(t["valid"]) == [True, False, False, False]
     assert t["diameter_px"][0] == 40 and np.isnan(t["diameter_px"][1])
     assert t["coverage"] == 0.75
+
+
+def _left_samples(lines):
+    return [l.split() for l in lines if l.startswith("P left ")]
+
+
+def test_blank_and_flat_eyelid_are_not_recovered():
+    clear = eye_frame(0)
+    blank = np.full_like(clear, 150)
+    slit = blank.copy()
+    slit[235:245, 100:220] = 20
+    slit[235:245, 420:540] = 20
+    frames = [clear] * 3 + [blank] * 3 + [slit] * 4 + [clear] * 3
+    lines, code = _stream(frames, ("--queue-depth", "100", "--min-pupil-px", "20", "--max-pupil-px", "80"))
+    assert code == 0
+    samples = _left_samples(lines)
+    assert all(p[4] == "0" and p[14] == "0" for p in samples[3:10])
+    assert all(p[15] == "absent" for p in samples[3:6])
+    assert samples[-1][4] == "1"  # recovery after a blink
+
+
+def _glint_frames():
+    yy, xx = np.mgrid[:H, :W]
+    clear = eye_frame(0)
+    damaged = clear.copy()
+    for cx in (W // 4, 3 * W // 4):
+        damaged[(xx - cx - 27) ** 2 + (yy - H // 2) ** 2 < 8 ** 2] = 230
+    return [clear] * 3 + [damaged] * 7 + [clear] * 3
+
+
+def test_flow_estimates_are_bounded_and_never_measurements():
+    args = ("--queue-depth", "100", "--confidence", ".99", "--min-pupil-px", "20", "--max-pupil-px", "80", "--glint-kernel", "0")
+    lines, code = _stream(_glint_frames(), args)
+    assert code == 0
+    samples = _left_samples(lines)
+    estimates = [p for p in samples if p[13] == "flow_estimate"]
+    assert estimates and len(estimates) <= 3
+    assert all(p[4] == "0" and p[14] == "1" for p in estimates)
+    assert all(p[14] == "0" for p in samples[6:10])
+    lines, code = _stream(_glint_frames(), (*args, "--flow-frames", "0"))
+    assert code == 0 and not any(p[14] == "1" for p in _left_samples(lines))
+
+
+@pytest.mark.parametrize("boundary", ["sequence", "timestamp", "reset"])
+def test_flow_does_not_cross_discontinuities(boundary):
+    frames = _glint_frames()[:4]
+    seqs = [0, 1, 2, 10] if boundary == "sequence" else None
+    stamps = [1_000_000_000, 1_033_333_333, 1_066_666_666, 1_500_000_000] if boundary == "timestamp" else None
+    resets = [True, False, False, True] if boundary == "reset" else None
+    lines, code = _stream(frames, ("--queue-depth", "100", "--confidence", ".99",
+                                  "--min-pupil-px", "20", "--max-pupil-px", "80", "--glint-kernel", "0"), seqs, stamps, resets)
+    assert code == 0 and _left_samples(lines)[-1][14] == "0"
+
+
+def test_csv_flow_estimate_is_excluded_even_with_zero_threshold(tmp_path):
+    path = tmp_path / "flow.csv"
+    path.write_text("Frame,Valid,Confidence,Outline_confidence,Diameter_px,Minor_px,Center_x,Center_y,Angle_deg,Proc_us,Source,Estimated,Visibility\n"
+                    "0,1,0.9,0.8,40,38,10,10,0,100,purest,0,visible\n"
+                    "1,1,0.6,0,42,38,11,10,0,100,flow_estimate,1,visible\n")
+    trace = purest.read_csv_trace(path, 2, 0)
+    assert list(trace["valid"]) == [True, False]
+    assert np.isnan(trace["diameter_px"][1]) and trace["estimate_px"][1] == 42
+    assert trace["tracking_source"][1] == "flow_estimate"
+
+
+def test_auto_mode_does_not_measure_frame_halves_when_eyes_are_missing():
+    lines, code = _stream([np.full((H, W), 140, np.uint8)] * 8,
+                          ("--eye-mode", "auto", "--queue-depth", "100"))
+    assert code == 0
+    for line in lines:
+        if line.startswith("P "):
+            p = line.split()
+            assert len(p) == 22 and p[4] == "0" and p[13] == "missing"
+            assert p[18:20] == ["0", "0"] and p[20] == "missing"
+
+
+def test_missing_localizer_models_fail_clearly(tmp_path):
+    proc = subprocess.run([str(purest.binary_path()), "--stream", "--cascade-dir", str(tmp_path)],
+                          input=b"", capture_output=True, timeout=10)
+    assert proc.returncode != 0
+    assert b"eye localization cascades missing" in proc.stderr
+    assert b"READY" not in proc.stdout
+
+
+def test_isolated_size_jump_is_rejected():
+    yy, xx = np.mgrid[:H, :W]
+    clear = eye_frame(0)
+    large = clear.copy()
+    for cx in (W // 4, 3 * W // 4):
+        large[(xx - cx) ** 2 + (yy - H // 2) ** 2 < 42 ** 2] = 20
+    lines, code = _stream([clear] * 3 + [large] + [clear] * 3,
+                          ("--queue-depth", "100", "--min-pupil-px", "20", "--max-pupil-px", "100"))
+    assert code == 0 and _left_samples(lines)[3][4] == "0"
+    assert _left_samples(lines)[-1][4] == "1"
+
+
+@pytest.mark.skipif(not os.environ.get("PLR_TEST_VIDEO"), reason="set PLR_TEST_VIDEO to a local full-face video")
+def test_full_face_sample_localization_and_measurement(tmp_path):
+    video = Path(os.environ["PLR_TEST_VIDEO"])
+    for swap in (False, True):
+        s = settings()
+        s["eye_localization"].update(mode="auto", swap_eyes=swap)
+        out = tmp_path / str(swap)
+        traces = purest.run_offline(video, out, s, frame_count=0)
+        for eye in purest.EYES:
+            trace = traces[eye]
+            assert trace["analysed"] > 100
+            assert trace["valid"].mean() > .75
+            boxes = trace["eye_boxes"]
+            valid = trace["valid"]
+            assert (trace["center_x"][valid] >= boxes[valid, 0]).all()
+            assert (trace["center_x"][valid] < boxes[valid, 0] + boxes[valid, 2]).all()
+        left_x = np.nanmedian(traces["left"]["center_x"])
+        right_x = np.nanmedian(traces["right"]["center_x"])
+        assert (left_x < right_x) if swap else (left_x > right_x)
