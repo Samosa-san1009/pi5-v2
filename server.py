@@ -58,6 +58,7 @@ from plr.display import TftDisplay  # noqa: E402
 from plr.endstops import EndstopMonitor  # noqa: E402
 from plr.leds import LedController  # noqa: E402
 from plr.orchestrator import SessionRecorder, _sleep_until  # noqa: E402
+from plr.preview import tracking_image  # noqa: E402
 from plr.settings import REPO_ROOT, SettingsStore  # noqa: E402
 
 logging.basicConfig(
@@ -81,7 +82,7 @@ STATE: dict = {
     "analyzer": "purest", "analysis_source": None, "live_coverage": None, "warnings": [],
 }
 BUSY = {"reason": None}                # what currently holds SESSION_LOCK
-BACKGROUND: dict = {"thread": None, "cancel": None, "info": None}   # offline pass after a live result
+BACKGROUND: dict = {"thread": None, "cancel": None, "info": None}   # explicit saved-session reanalysis
 RIG: dict = {}
 
 
@@ -244,31 +245,6 @@ def cancel_background(wait_s: float = 5.0):
         thread.join(wait_s)
 
 
-def start_background_offline(session_dir: Path, session_id: str, settings: dict, participant, log_path: Path):
-    cancel = threading.Event()
-    info = {"session_id": session_id, "job": "offline_purest", "state": "running", "fraction": 0.0}
-
-    def work():
-        logger = session_logger(log_path, f"{session_id}.offline")
-        try:
-            result = offline_pass(session_dir, session_id, settings, participant, logger,
-                                  progress=lambda f: info.update(fraction=round(f, 3)), cancel=cancel)
-            info.update(state="done", fraction=1.0, status=result["status"])
-        except purest.OfflineCancelled:
-            info.update(state="cancelled")
-            logger.info("offline PuReST cancelled (a new session started); re-run with /sessions/%s/reanalyze",
-                        session_id)
-        except Exception as exc:
-            info.update(state="error", error=str(exc))
-            logger.exception("offline PuReST failed")
-        finally:
-            close_logger(logger)
-
-    thread = threading.Thread(target=work, daemon=True, name=f"offline-{session_id}")
-    BACKGROUND.update(thread=thread, cancel=cancel, info=info)
-    thread.start()
-
-
 def run_session(config: dict, paths: dict, settings: dict):
     logger = session_logger(paths["log"], paths["session_id"])
     session_dir, session_id = paths["session_dir"], paths["session_id"]
@@ -278,16 +254,26 @@ def run_session(config: dict, paths: dict, settings: dict):
     live_traces = None
     try:
         write_manifest(paths, config, settings)
-        live_on = bool(purest_cfg["live"]) and live.begin_session()
-        if purest_cfg["live"] and not live_on:
-            logger.warning("live PuReST not running (%s); results will come from the offline pass", live.error)
+        live_on = False
+        if purest_cfg["live"]:
+            try:
+                live_on = live.begin_session()
+            except Exception:
+                logger.exception("Live preview failed to start; saved-video analysis will still run")
+            if not live_on:
+                logger.warning("Live preview unavailable (%s); the saved video will still be analyzed", live.error)
         set_state(stage="recording", started_at=time.time())
         recorder = SessionRecorder(config, paths, RIG["camera"], RIG["leds"], RIG["endstops"],
                                    settings["endstops"], logger, ABORT)
         try:
             timeline = recorder.run()["timeline"]
         finally:
-            collected = live.end_session() if purest_cfg["live"] else None
+            collected = None
+            if purest_cfg["live"]:
+                try:
+                    collected = live.end_session()
+                except Exception:
+                    logger.exception("Live collection failed; continuing with saved-video analysis")
         set_state(stage="analysis", warnings=timeline["warnings"],
                   progress={"completed": 0, "total": 2, "item": "both eyes", "item_status": "live",
                             "fraction": 0.0})
@@ -297,49 +283,30 @@ def run_session(config: dict, paths: dict, settings: dict):
 
         stamps, _ = load_frame_times(session_dir)
         if collected is not None and live_on and stamps:
-            live_traces = purest.live_traces(collected, stamps, float(purest_cfg["confidence_threshold"]))
-            engine = {**live.status(), "frames": len(stamps),
-                      "dropped": {e: len(collected["dropped"][e]) for e in purest.EYES}}
-            result = build_results(session_dir, session_id, live_traces, "live", settings, participant,
-                                   suffix="_live", engine=engine)
-            logger.info("live PuReST: %s, coverage %s", result["status"], result["coverage"])
-            set_state(live_coverage=result["coverage"])
+            try:
+                live_traces = purest.live_traces(collected, stamps, float(purest_cfg["confidence_threshold"]))
+                engine = {**live.status(), "frames": len(stamps),
+                          "dropped": {e: len(collected["dropped"][e]) for e in purest.EYES}}
+                result = build_results(session_dir, session_id, live_traces, "live", settings, participant,
+                                       suffix="_live", engine=engine)
+                logger.info("Live preview pass: %s, coverage %s", result["status"], result["coverage"])
+                set_state(live_coverage=result["coverage"])
+            except Exception:
+                logger.exception("Could not save live preview results; continuing with saved-video analysis")
 
-        coverage_ok = live_traces is not None and all(
-            live_traces[e]["coverage"] >= float(purest_cfg["live_min_coverage"]) for e in purest.EYES)
-        report = purest_cfg["report"]
-        use_live = live_traces is not None and (
-            report == "live" or (report == "auto" and coverage_ok) or not purest_cfg["offline"])
-
-        if use_live:
-            copy_results(session_dir, "_live")
-            status = json.loads((session_dir / "metrics.json").read_text())["status"]
-            set_state(stage="done", ended_at=time.time(), session_status=status, analysis_source="live",
-                      progress=None)
-            logger.info("Session complete from the live pass: %s", status)
-            if purest_cfg["offline"]:
-                start_background_offline(session_dir, session_id, settings, participant, paths["log"])
-            return
-
+        # Always analyze the finalized MP4, including manual Stop and legacy
+        # live/auto settings. Publish DONE only once these results are saved.
         set_state(stage="analysis", progress={"completed": 0, "total": 2, "item": "both eyes",
-                                              "item_status": "analyzing", "fraction": 0.0})
-        try:
-            result = offline_pass(session_dir, session_id, settings, participant, logger,
-                                  progress=lambda f: set_state(progress={
-                                      "completed": 2 if f >= 1 else 0, "total": 2, "item": "both eyes",
-                                      "item_status": "analyzing", "fraction": round(f, 3)}))
-            copy_results(session_dir, "_offline")
-            source = "offline"
-        except Exception:
-            if live_traces is None:
-                raise
-            logger.exception("offline PuReST failed; reporting the live pass instead")
-            copy_results(session_dir, "_live")
-            result = {"status": json.loads((session_dir / "metrics.json").read_text())["status"]}
-            source = "live"
+                                              "item_status": "softflow_lite_offline", "fraction": 0.0})
+        logger.info("Starting PuReST Soft Flow Lite on saved video: %s", session_dir / "full_video.mp4")
+        result = offline_pass(session_dir, session_id, settings, participant, logger,
+                              progress=lambda f: set_state(progress={
+                                  "completed": 2 if f >= 1 else 0, "total": 2, "item": "both eyes",
+                                  "item_status": "softflow_lite_offline", "fraction": round(f, 3)}))
+        copy_results(session_dir, "_offline")
         set_state(stage="done", ended_at=time.time(), session_status=result["status"],
-                  analysis_source=source, progress=None)
-        logger.info("Session complete from the %s pass: %s", source, result["status"])
+                  analysis_source="offline", progress=None)
+        logger.info("Session complete from saved-video Soft Flow Lite: %s", result["status"])
     except Exception as exc:
         failed = state_copy()["stage"]
         logger.exception("Session failed at stage=%s", failed)
@@ -386,6 +353,11 @@ def results_payload(session_dir: Path, source: str | None = None):
 
 
 # ── routes: app contract ────────────────────────────────────────────────────
+
+@app.route("/", methods=["GET"])
+@app.route("/monitor", methods=["GET"])
+def monitor():
+    return send_file(REPO_ROOT / "plr" / "web" / "monitor.html", max_age=0)
 
 @app.route("/health", methods=["GET"])
 def health():
@@ -633,11 +605,13 @@ def reanalyze(session_id):
 
 # ── routes: live view, LEDs, diagnostics ────────────────────────────────────
 
-def _jpeg(grey) -> bytes:
+def _jpeg(grey, overlay=True) -> bytes:
     from PIL import Image
 
     buf = io.BytesIO()
-    Image.fromarray(grey, "L").save(buf, format="JPEG", quality=80)
+    image = (tracking_image(grey, SETTINGS.section("camera")["resolution"], RIG.get("live"), state_copy())
+             if overlay else Image.fromarray(grey, "L"))
+    image.save(buf, format="JPEG", quality=80)
     return buf.getvalue()
 
 
@@ -646,12 +620,13 @@ def preview():
     item = RIG["camera"].sink.wait(0, timeout=2.0)
     if item is None:
         return jsonify({"error": "no frame yet"}), 503
-    return Response(_jpeg(item[1]), mimetype="image/jpeg")
+    return Response(_jpeg(item[1], request.args.get("overlay", "1") != "0"), mimetype="image/jpeg")
 
 
 @app.route("/stream.mjpg", methods=["GET"])
 def stream():
     fps = min(15.0, max(1.0, float(request.args.get("fps", 10))))
+    overlay = request.args.get("overlay", "1") != "0"
 
     def frames():
         seq = 0
@@ -660,7 +635,7 @@ def stream():
             if item is None:
                 continue
             seq, grey, _ = item
-            yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + _jpeg(grey) + b"\r\n"
+            yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + _jpeg(grey, overlay) + b"\r\n"
             time.sleep(1.0 / fps)
 
     return Response(frames(), mimetype="multipart/x-mixed-replace; boundary=frame")

@@ -36,6 +36,7 @@ private:
     EyeRegions cached_;
     cv::Size size_;
     int64_t detected_at_ = 0, last_ts_ = 0;
+    int64_t last_search_ts_ = 0;
     int since_search_ = 0;
     bool have_frame_ = false;
 };

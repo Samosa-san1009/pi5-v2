@@ -22,6 +22,7 @@ by that same timestamp.
 from __future__ import annotations
 
 import os
+import logging
 import shutil
 import subprocess
 import threading
@@ -31,6 +32,8 @@ from pathlib import Path
 import numpy as np
 
 from . import timebase
+
+LOG = logging.getLogger("plr.camera")
 
 
 class _FrameSink:
@@ -78,6 +81,9 @@ class CameraService:
         self._sink_period_ns = int(1e9 / 15)
         self.sensor_clock: str | None = None
         self.error: str | None = None
+        self.callback_errors = 0
+        self.last_callback_error = None
+        self._last_callback_error_log_ns = 0
         self.restarts = 0
         self.camera_info: dict = {}
         self._stop = threading.Event()
@@ -209,8 +215,12 @@ class CameraService:
                 with MappedArray(request, "lores") as mapped:
                     small = mapped.array[:height, :width].copy()
                 self.sink.publish(small, ts)
-        except Exception:
-            pass
+        except Exception as exc:
+            self.callback_errors += 1
+            self.last_callback_error = f"{type(exc).__name__}: {exc}"
+            if now - self._last_callback_error_log_ns > 5_000_000_000:
+                self._last_callback_error_log_ns = now
+                LOG.exception("Camera frame could not reach tracking/preview")
 
     # ── recording ───────────────────────────────────────────────────────────
     @property
@@ -283,6 +293,8 @@ class CameraService:
     def status(self) -> dict:
         age = (time.monotonic_ns() - self._last_frame_mono) / 1e9 if self._last_frame_mono else None
         return {
+            "callback_errors": self.callback_errors,
+            "last_callback_error": self.last_callback_error,
             "available": self._picam is not None,
             "running": self._picam is not None and age is not None and age < 2.0,
             "recording": self.recording,

@@ -23,6 +23,8 @@ import collections
 import csv
 import math
 import os
+import re
+import select
 import shutil
 import struct
 import subprocess
@@ -36,6 +38,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_BINARY = REPO_ROOT / "native" / "purest" / "build" / "plr_purest"
 EYES = ("left", "right")
 _HEADER = struct.Struct("<4sIQqII")      # magic, flags, seq, ts_ns, width, height
+_BINARY_CACHE = {}
 
 
 def binary_path() -> Path:
@@ -46,7 +49,22 @@ def binary_status() -> dict:
     path = binary_path()
     if not path.is_file():
         return {"ready": False, "binary": str(path), "error": "not built: run scripts/build_native.sh"}
-    return {"ready": True, "binary": str(path)}
+    stat = path.stat()
+    key = (str(path), stat.st_mtime_ns, stat.st_size, stat.st_mode)
+    if key not in _BINARY_CACHE:
+        result = {"ready": False, "binary": str(path)}
+        try:
+            probe = subprocess.run([str(path), "--version"], capture_output=True, text=True, timeout=5)
+            version = probe.stdout.strip()
+            match = re.match(r"(\d+)\.(\d+)\.(\d+)-softflow-lite", version)
+            if probe.returncode or not match or tuple(map(int, match.groups())) < (2, 3, 0):
+                raise RuntimeError(f"outdated/incompatible native tracker ({version or probe.stderr.strip() or 'no version'})")
+            result.update(ready=True, version=version)
+        except (OSError, subprocess.SubprocessError, RuntimeError) as exc:
+            result["error"] = f"{exc}; run bash scripts/build_native.sh and restart plr.service"
+        _BINARY_CACHE.clear()
+        _BINARY_CACHE[key] = result
+    return dict(_BINARY_CACHE[key])
 
 
 def _engine_args(settings: dict) -> list[str]:
@@ -146,11 +164,16 @@ class LiveEngine:
         self._last_start = time.monotonic()
         proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, bufsize=0)
-        line = proc.stdout.readline().decode(errors="replace").strip()
+        readable, _, _ = select.select([proc.stdout], [], [], 8)
+        line = proc.stdout.readline().decode(errors="replace").strip() if readable else ""
         if not line.startswith("READY"):
-            err = proc.stderr.read().decode(errors="replace")[-400:] if proc.poll() is not None else ""
-            proc.kill()
-            raise RuntimeError(f"live PuReST did not start: {line or err or 'no output'}")
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait(timeout=3)
+            err = proc.stderr.read().decode(errors="replace")[-600:]
+            for pipe in (proc.stdin, proc.stdout, proc.stderr):
+                pipe.close()
+            raise RuntimeError(f"live PuReST did not start: {line or err or 'startup timed out'}")
         self._proc = proc
         self.error = None
         threading.Thread(target=self._read_loop, args=(proc,), name="purest-read", daemon=True).start()
@@ -190,7 +213,7 @@ class LiveEngine:
             return False
         if self._session is not None:
             return True
-        if self._idle_period_ns is None or not self.settings["display"].get("show_pupils", True):
+        if self._idle_period_ns is None:
             return False
         if ts_ns - self._last_idle_ns >= self._idle_period_ns:
             self._last_idle_ns = ts_ns
@@ -198,8 +221,8 @@ class LiveEngine:
         return False
 
     def submit(self, grey: np.ndarray, seq: int, ts_ns: int):
-        flags = 0
         session = self._session
+        flags = 2 if session is None else 0
         with self._lock:
             if self._reset_next:
                 flags |= 1
@@ -328,11 +351,21 @@ class LiveEngine:
             return {"median_ms": round(values[len(values) // 2] / 1000, 2),
                     "p95_ms": round(values[int(len(values) * 0.95) - 1 if len(values) > 1 else 0] / 1000, 2)}
 
+        def preview_sample(eye):
+            sample = self.latest[eye]
+            if sample is None:
+                return None
+            out = {k: (None if isinstance(v, float) and not math.isfinite(v) else v)
+                   for k, v in sample.items() if k != "at"}
+            out["age_s"] = round(time.monotonic() - sample["at"], 3)
+            return out
+
         return {
             "enabled": self.enabled,
             "variant": "softflow_lite",
             "eye_localization": self.settings.get("eye_localization", {"mode": "fixed"}),
             "eye_boxes": {e: (self.latest[e] or {}).get("eye_box") for e in EYES},
+            "latest": {e: preview_sample(e) for e in EYES},
             "running": self.ready,
             "error": self.error,
             "restarts": self.restarts,

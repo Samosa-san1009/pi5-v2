@@ -20,15 +20,13 @@ camera ──► every uncompressed frame ──► plr_purest --stream ──�
                                          (after recording)
 ```
 
-* **Live:** during the recording PuReST tracks both eyes on every raw camera
-  frame (better than the compressed video). When recording stops, the result
-  is ready almost at once.
-* **Offline:** afterwards the saved video is analysed again, every frame,
-  both eyes in parallel. This is the safety net if the live pass ever had to
-  drop frames.
-* **What the app gets** (`purest.report`, default `auto`): the live result if
-  both eyes covered at least 98 % of the frames, otherwise the app waits for
-  the offline result. Both results are always saved in the session folder.
+* **Live:** the native tracker processes camera frames for the TFT/browser
+  overlay. A live trace is also saved for diagnostics when available.
+* **After recording:** Soft Flow Lite always processes the finalized MP4 for
+  both eyes. This also happens when you manually stop a partial experiment.
+* **What the app gets:** the server stays at `analysis` until the saved-video
+  pupilograms and metrics have been written, then publishes `done` and the
+  offline result through `/results`. Failures are reported as errors.
 * Between sessions the live engine keeps tracking at 5 fps so the TFT shows
   the pupils while you line up the rig.
 
@@ -270,7 +268,8 @@ Your settings and recorded sessions are kept.
 | GET / POST | `/settings` | read / change settings (partial JSON) |
 | POST | `/settings/reset` | defaults |
 | GET | `/purest` | live engine: per-eye processing time, dropped frames, background job |
-| GET | `/preview.jpg`, `/stream.mjpg` | live IR picture |
+| GET | `/`, `/monitor` | browser live overlay, both pupilograms, metrics and saved-session reanalysis |
+| GET | `/preview.jpg`, `/stream.mjpg` | live eye/pupil overlay; `?overlay=0` gives raw IR |
 | POST | `/leds/test` | `{"side":"left","hex":"#FFFFFF","intensity":50,"duration":0.2}` |
 | POST | `/selftest` | flash each LED, check the endstops see it |
 | GET | `/sessions` | recorded sessions |
@@ -283,9 +282,9 @@ Your settings and recorded sessions are kept.
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `purest.live` / `purest.offline` | `true` / `true` | run each pass |
-| `purest.report` | `auto` | `auto`, `live` or `offline`: which result the app gets |
-| `purest.live_min_coverage` | `0.98` | fraction of frames the live pass must cover per eye for `auto` |
+| `purest.live` / `purest.offline` | `true` / `true` | live preview can be disabled; saved-video analysis is always enabled |
+| `purest.report` | `offline` | legacy `auto`/`live` values migrate to the final saved-video result |
+| `purest.live_min_coverage` | `0.98` | retained for compatibility; no longer skips saved-video analysis |
 | `purest.cpus` | `[2, 3]` | cores for the two eye threads |
 | `purest.min_pupil_px` / `max_pupil_px` | none | pupil size limits in camera pixels |
 | `purest.confidence_threshold` | `0.70` | lower-confidence samples are marked invalid |
@@ -329,7 +328,8 @@ Your settings and recorded sessions are kept.
 | TFT stays black | VCC on pin 17? SPI enabled (re-run the installer, reboot)? |
 | TFT picture turned 90° or a coloured strip at one side | `display` must be `width` 320, `height` 240, `rotate` 0 (or 2). |
 | Trace jumps to iris size | Set `purest.max_pupil_px` (step 7.5) and tighten the eye boxes. |
-| App result came from `offline` and took longer | The live pass dropped frames: check `/purest` and keep other programs off the Pi. |
+| Video finishes but results are missing | Open `/monitor` and `/purest`; check native version and `/status` error. Rebuild after updating code. |
+| Overlay absent between experiments | Use native 2.3.0+ and nonzero `purest.idle_preview_fps`; the decimated preview now preserves confirmation. |
 
 ### Testing without the rig (PC or Pi)
 
@@ -400,3 +400,40 @@ select `eye_localization.mode: "fixed"` before running a mock session.
 Validation: `ctest --test-dir native/purest/build --output-on-failure` and
 `python -m pytest tests -q`. Set `PLR_TEST_VIDEO=/path/full_video.mp4` to also
 exercise full-face localization, bilateral measurement and mirrored labels.
+
+## Live overlay and results on the Pi
+
+Open `http://PI_ADDRESS:5000/monitor` on the phone or a browser. It shows
+live eye boxes/pupil circles, recording/analysis progress, both final
+pupilograms, per-flash metrics, video download, and saved experiments.
+Use **Analyze saved video again** to rerun and publish a selected session's
+result. The existing app still reads the same `/results` endpoint.
+
+After updating an existing Pi checkout:
+
+```bash
+git pull --ff-only
+bash scripts/build_native.sh
+sudo systemctl restart plr.service
+```
+
+`GET /purest` must report a compatible native version (2.3.0 or newer).
+The server checks the executable rather than just whether its file exists.
+An old/missing binary gives an explicit rebuild instruction. Existing rig
+settings retain their GPIO/camera values while legacy live-only reporting
+settings migrate to mandatory saved-video analysis.
+
+Idle preview is controlled independently of the TFT. If it was previously
+turned off, enable it with:
+
+```bash
+curl -X POST http://localhost:5000/settings -H 'Content-Type: application/json' \
+  -d '{"purest":{"live":true,"idle_preview_fps":5}}'
+```
+
+Validation for the recording/preview integration fix: 78 tests passed with
+`PLR_TEST_VIDEO` pointing at the provided full-face clip, plus CTest. A running
+mock-camera experiment was also exercised through HTTP: it reached `done`,
+reported `analysis_source: offline`, and displayed both pupilograms and
+per-flash metrics in `/monitor`. This verifies the software handoff; it is
+not an on-device Pi hardware test.

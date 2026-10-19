@@ -62,7 +62,7 @@ def build_results(session_dir: Path, session_id: str, traces: dict, source: str,
         if trace is None:
             failures[eye] = "no PuReST trace"
         elif not trace["valid"].any():
-            failures[eye] = "PuReST found no pupil in this eye's region (check eye_roi and focus)"
+            failures[eye] = "Soft Flow Lite found no accepted pupil measurements for this eye (check focus, illumination and eye boxes)"
 
     metric_events = []
     for event in events:

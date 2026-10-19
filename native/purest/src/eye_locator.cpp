@@ -55,8 +55,11 @@ EyeRegions EyeLocator::locate(const cv::Mat &gray, uint64_t seq, int64_t ts, boo
     (void)seq;
     last_ts_ = ts;
     const bool expired = cached_.eye[0].empty() || ts - detected_at_ > config_.ttl_ms * 1e6;
-    if (++since_search_ >= config_.interval) {
+    // Decimated preview still needs a refresh before its boxes expire; retry
+    // timing is based on the last search, including unsuccessful searches.
+    if (++since_search_ >= config_.interval || ts - last_search_ts_ >= config_.ttl_ms * .5e6) {
         since_search_ = 0;
+        last_search_ts_ = ts;
         cv::Mat small, equalized;
         const float scale = std::min(1.f, 320.f / std::max(gray.cols, gray.rows));
         cv::resize(gray, small, {}, scale, scale, cv::INTER_AREA);

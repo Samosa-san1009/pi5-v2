@@ -11,6 +11,33 @@ This is an adaptation of the reference's recovery design, not the same model
 with equivalent accuracy. The original uses future observations to confirm
 gaps and interpolate axes; the rig's live/offline engine is causal in both modes.
 
+## Recording, idle preview and final results
+
+The server always invokes Soft Flow Lite on the saved MP4 after recording
+closes. The app remains in `analysis` until the offline pupilogram/metrics
+are saved and promoted, then sees `done` and `analysis_source: offline`.
+Live preview/startup/trace failures do not bypass this pass. A failed offline
+pass is reported explicitly, rather than silently falling back to live output.
+Legacy `report: auto/live` and `offline: false` settings are migrated while
+preserving the rig's remaining settings.
+
+Manual Stop now closes the recording, saves frame/flash timing and analyzes
+the partial experiment. An interrupted flash is retained in its command log.
+
+Idle camera frames carry a dedicated preview flag (stream flags bit 1).
+This preserves two-observation confirmation when the preview intentionally
+samples a 30 fps camera at 5 fps: sequence gaps and 200 ms spacing no longer
+reset it every time. Idle mode never runs optical-flow gap interpolation.
+Recording mode retains its strict dropped-frame and time-gap checks. Eye-box
+refresh also accounts for elapsed time so decimated boxes do not expire
+before the next scheduled search. Mode transitions reset temporal evidence.
+
+`/preview.jpg` and `/stream.mjpg` now draw fresh eye boxes and pupil circles;
+`?overlay=0` provides raw IR. `/monitor` (also `/`) adds browser pupilograms,
+metrics, progress, diagnostics and a saved-session reanalysis button. It uses
+Pillow and browser canvas, so the Pi server needs no Matplotlib or Python
+OpenCV. Native binaries older than 2.3.0 are rejected with a rebuild instruction.
+
 ## Finding eyes in a full-face camera frame
 
 Automatic localization is the default. Bundled OpenCV Haar cascades run in

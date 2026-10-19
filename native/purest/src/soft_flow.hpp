@@ -30,7 +30,7 @@ struct Detection {
 class SoftFlow {
 public:
     explicit SoftFlow(SoftFlowConfig config = {});
-    Detection run(const cv::Mat &eye, uint64_t seq, int64_t timestamp_ns);
+    Detection run(const cv::Mat &eye, uint64_t seq, int64_t timestamp_ns, bool preview = false);
     void reset();
 
 private:
@@ -52,5 +52,6 @@ private:
     int64_t last_ts_ = 0, anchor_ts_ = 0;
     int lost_ = 0;
     bool have_frame_ = false;
+    bool was_preview_ = false;
 };
 } // namespace plr

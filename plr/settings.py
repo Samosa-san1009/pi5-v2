@@ -100,12 +100,9 @@ DEFAULTS: dict = {
         #   offline  after recording, on every frame of the saved video
         "live": True,
         "offline": True,
-        # Which result the app gets:
-        #   "auto"    live result straight away if both eyes covered at least
-        #             live_min_coverage of the frames, else wait for offline
-        #   "live"    always the live result (offline still runs afterwards)
-        #   "offline" always wait for the offline result
-        "report": "auto",
+        # The saved video is always analyzed before publishing the final result.
+        # Legacy report/offline values are normalized by validate().
+        "report": "offline",
         "live_min_coverage": 0.98,
         # Keep tracking at this rate between sessions, so the TFT shows the
         # pupils while you line the rig up. 0 = only while recording.
@@ -246,6 +243,10 @@ def validate(settings: dict) -> dict:
         raise ValueError("purest.report must be auto, live or offline")
     if not (purest["live"] or purest["offline"]):
         raise ValueError("purest.live and purest.offline cannot both be off")
+    # Migrate existing rigs without discarding their GPIO/camera settings.
+    # Live tracking is a preview; it must never skip post-recording analysis.
+    purest["offline"] = True
+    purest["report"] = "offline"
     _clamp(purest["live_min_coverage"], 0, 1, "purest.live_min_coverage")
     _clamp(purest["idle_preview_fps"], 0, 30, "purest.idle_preview_fps")
     _clamp(purest["confidence_threshold"], 0, 1, "purest.confidence_threshold")

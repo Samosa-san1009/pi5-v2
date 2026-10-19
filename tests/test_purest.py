@@ -91,7 +91,7 @@ def test_offline_tracks_both_eyes_every_frame(video, tmp_path, frames):
         assert abs(np.nanmedian(t["center_x"]) - (W / 4 if side == "left" else 3 * W / 4)) < 2
 
 
-def _stream(frames, extra=(), seqs=None, timestamps=None, resets=None):
+def _stream(frames, extra=(), seqs=None, timestamps=None, resets=None, preview=False):
     cmd = [str(purest.binary_path()), "--stream", "--eye-mode", "fixed", *extra]
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     data = bytearray()
@@ -99,7 +99,7 @@ def _stream(frames, extra=(), seqs=None, timestamps=None, resets=None):
         seq = seqs[i] if seqs is not None else i
         ts = timestamps[i] if timestamps is not None else 1_000_000_000 + i * 33_333_333
         reset = resets[i] if resets is not None else i == 0
-        data += purest._HEADER.pack(b"PLR1", int(reset), seq, ts, W, H) + f.tobytes()
+        data += purest._HEADER.pack(b"PLR1", int(reset) | (2 if preview else 0), seq, ts, W, H) + f.tobytes()
     out, err = proc.communicate(bytes(data), timeout=60)
     return out.decode().splitlines(), proc.returncode
 
@@ -337,6 +337,21 @@ def test_isolated_size_jump_is_rejected():
     assert _left_samples(lines)[-1][4] == "1"
 
 
+def test_idle_preview_confirms_pupils_at_five_fps_despite_camera_sequence_gaps():
+    frames = [eye_frame(0)] * 8
+    stamps = [1_000_000_000 + i * 200_000_000 for i in range(len(frames))]
+    seqs = [i * 6 for i in range(len(frames))]
+    lines, code = _stream(frames, ("--queue-depth", "100", "--min-pupil-px", "20", "--max-pupil-px", "80"),
+                          seqs=seqs, timestamps=stamps, preview=True)
+    assert code == 0
+    samples = _left_samples(lines)
+    assert samples[0][4] == "0"
+    assert all(p[4] == "1" for p in samples[1:])
+    assert all(p[14] == "0" for p in samples)  # never interpolate idle preview
+    strict, _ = _stream(frames, ("--queue-depth", "100"), seqs=seqs, timestamps=stamps)
+    assert all(p[4] == "0" for p in _left_samples(strict))  # recording gap rules stay strict
+
+
 @pytest.mark.skipif(not os.environ.get("PLR_TEST_VIDEO"), reason="set PLR_TEST_VIDEO to a local full-face video")
 def test_full_face_sample_localization_and_measurement(tmp_path):
     video = Path(os.environ["PLR_TEST_VIDEO"])
@@ -356,3 +371,21 @@ def test_full_face_sample_localization_and_measurement(tmp_path):
         left_x = np.nanmedian(traces["left"]["center_x"])
         right_x = np.nanmedian(traces["right"]["center_x"])
         assert (left_x < right_x) if swap else (left_x > right_x)
+
+
+@pytest.mark.skipif(not os.environ.get("PLR_TEST_VIDEO"), reason="set PLR_TEST_VIDEO to a local full-face video")
+def test_full_face_idle_preview_refreshes_boxes_before_expiry():
+    if not shutil.which("ffmpeg"):
+        pytest.skip("ffmpeg required")
+    raw = subprocess.check_output(["ffmpeg", "-v", "error", "-i", os.environ["PLR_TEST_VIDEO"],
+                                   "-frames:v", "120", "-vf", f"scale={W}:{H}", "-f", "rawvideo", "-pix_fmt", "gray", "-"])
+    frames = np.frombuffer(raw, np.uint8).reshape(-1, H, W)[::6]
+    seqs = [i * 6 for i in range(len(frames))]
+    stamps = [1_000_000_000 + i * 200_000_000 for i in range(len(frames))]
+    lines, code = _stream(frames, ("--eye-mode", "auto", "--queue-depth", "100"),
+                          seqs=seqs, timestamps=stamps, preview=True)
+    assert code == 0
+    for eye in ("left", "right"):
+        samples = [line.split() for line in lines if line.startswith(f"P {eye} ")]
+        assert sum(int(p[18]) > 0 for p in samples) > .8 * len(samples)
+        assert sum(p[4] == "1" for p in samples) > .5 * len(samples)

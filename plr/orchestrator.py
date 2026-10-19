@@ -72,6 +72,7 @@ class SessionRecorder:
         rec_start_ns = recording["started_monotonic_ns"]
         self.log.info("Recording started -> %s (%s)", self.paths["video"], recording.get("output"))
         result = None
+        stopped = False
         try:
             _sleep_until(time.monotonic_ns() + int(cfg["pre_roll_s"] * 1e9), self.abort)
             _sleep_until(time.monotonic_ns() + int(cfg["schedule"].get("initial_delay_ms", 0) * 1e6), self.abort)
@@ -85,6 +86,10 @@ class SessionRecorder:
             else:
                 raise ValueError(f"unknown mode {mode!r}")
             _sleep_until(time.monotonic_ns() + int(cfg["post_roll_s"] * 1e9), self.abort)
+        except SessionAborted:
+            stopped = True
+            warnings.append("Recording stopped by request; analyzing the saved partial experiment")
+            self.log.info("Recording stopped by request; preserving video and timing for analysis")
         finally:
             try:
                 self.leds.all_off()
@@ -96,6 +101,7 @@ class SessionRecorder:
 
         frames = [ts for ts in (result.get("frame_timestamps_ns") or []) if ts is not None]
         timeline = self._build_timeline(frames, rec_start_ns, rec_end_ns)
+        timeline["stopped_by_request"] = stopped
         timeline["warnings"] = warnings + timeline["warnings"]
         timeline["clock_anchor_start"] = anchor_start
         timeline["clock_anchor_end"] = timebase.anchor()
@@ -112,8 +118,11 @@ class SessionRecorder:
             colors[side] = rgb
         on = self.leds.set(colors)
         deadline = on["end_ns"] + int(duration_ms * 1e6)
+        aborted = None
         try:
             _sleep_until(deadline, self.abort)
+        except SessionAborted as exc:
+            aborted = exc
         finally:
             off = self.leds.set({side: (0, 0, 0) for side in sides})
         for side in sides:
@@ -131,6 +140,8 @@ class SessionRecorder:
                 "duration_ms": duration_ms,
                 **meta,
             })
+        if aborted is not None:
+            raise aborted
 
     def _run_dual(self):
         sched = self.config["schedule"]

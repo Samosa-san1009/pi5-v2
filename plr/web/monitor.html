@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mobile PLR · Live tracking and results</title>
+<style>
+body{margin:0;background:#f4f7fb;color:#162238;font:15px system-ui,sans-serif}main{max-width:1120px;margin:auto;padding:24px}h1{font-size:25px;margin:0 0 8px}h2{font-size:18px}p{line-height:1.5}.card{background:white;border:1px solid #dde5ef;border-radius:12px;padding:20px;margin:16px 0}.grid{display:grid;grid-template-columns:1fr 1fr;gap:20px}img{display:block;width:100%;min-height:150px;background:#111827;border-radius:8px}#stage{font-weight:600;color:#234f94}#message{white-space:pre-wrap;color:#a52a2a}select,button{font:inherit;border:1px solid #bac9df;border-radius:6px;background:white;padding:9px;color:#17417a}button:disabled{opacity:.5}select{max-width:100%}canvas{display:block;width:100%;height:240px}.quiet{font-size:13px;color:#53647c}table{width:100%;border-collapse:collapse;font-size:13px}td,th{text-align:left;border-bottom:1px solid #e4eaf2;padding:9px 5px}.scroll{overflow:auto}a{color:#245fb3}#links{display:flex;gap:18px;margin-top:12px}#links[hidden]{display:none}@media(max-width:720px){main{padding:12px}.grid{grid-template-columns:1fr}.card{padding:14px}canvas{height:210px}}
+</style>
+<main>
+<h1>Mobile PLR · Soft Flow Lite</h1>
+<p id="stage" role="status">Connecting to the Pi…</p><p id="message" role="alert"></p>
+<section class="card grid">
+ <div><h2>Live eye tracking</h2><img src="/stream.mjpg?overlay=1" alt="Live camera with eye boxes and pupil circles"><p class="quiet">Blue: subject's left eye · Red: right eye · Green: measured pupil. Tracking continues between recordings.</p></div>
+ <div><h2>Tracker status</h2><p id="tracker">Checking native tracker…</p><p>The final result comes from Soft Flow Lite analyzing the saved MP4. Recording stops first; results appear when analysis finishes.</p><p><a href="/purest" target="_blank">Detailed tracker diagnostics</a> · <a href="/preview.jpg" target="_blank">Overlay snapshot</a></p></div>
+</section>
+<section class="card">
+ <h2>Experiment results</h2>
+ <label for="session">Saved experiment</label> <select id="session"><option value="">No experiment selected</option></select>
+ <button id="reanalyze" disabled>Analyze saved video again</button>
+ <p id="resultStatus" class="quiet">Waiting for a recording.</p>
+ <div id="links" hidden><a id="video">Recorded video</a><a id="json">Full result JSON</a></div>
+ <h2 id="leftTitle">Left-eye pupilogram</h2><canvas id="left" aria-label="Left-eye pupil diameter versus time"></canvas>
+ <h2 id="rightTitle">Right-eye pupilogram</h2><canvas id="right" aria-label="Right-eye pupil diameter versus time"></canvas>
+ <p class="quiet">Diameter is in camera pixels. Rejected frames and flow-only estimates remain gaps. A valid-frame percentage is coverage, not an accuracy score.</p>
+ <h2>Per-flash responses</h2><div class="scroll"><table><thead><tr><th>Flash</th><th>Eye</th><th>Response</th><th>MCA (px)</th><th>MCV (px/s)</th><th>Latency (ms)</th></tr></thead><tbody id="metrics"></tbody></table></div>
+</section>
+</main>
+<script>
+const $=id=>document.getElementById(id);
+let current=null, selection='', signature='', loaded=false, activeSession=null;
+async function get(url,options){const r=await fetch(url,{cache:'no-store',...options});const d=await r.json();if(!r.ok)throw Error(d.error||`HTTP ${r.status}`);return d;}
+function plot(eye){
+ const canvas=$(eye),ctx=canvas.getContext('2d'),w=canvas.clientWidth||600,h=canvas.clientHeight||240,dpr=window.devicePixelRatio||1;
+ canvas.width=w*dpr;canvas.height=h*dpr;ctx.scale(dpr,dpr);ctx.clearRect(0,0,w,h);ctx.fillStyle='#fff';ctx.fillRect(0,0,w,h);
+ const samples=current?.pupilogram?.eyes?.[eye]?.samples||[],valid=samples.filter(s=>s.valid&&Number.isFinite(s.diameter_px));
+ $(eye+'Title').textContent=eye[0].toUpperCase()+eye.slice(1)+` eye · ${valid.length}/${samples.length} measured frames`;
+ if(!valid.length){ctx.fillStyle='#53647c';ctx.fillText('No valid pupil measurements available.',50,60);return;}
+ const lo=valid.reduce((a,s)=>Math.min(a,s.diameter_px),Infinity),hi=valid.reduce((a,s)=>Math.max(a,s.diameter_px),-Infinity),pad=Math.max(1,(hi-lo)*.12);
+ const ymin=lo-pad,ymax=hi+pad,tmax=Math.max(.1,samples[samples.length-1].time_s),x=t=>52+t/tmax*(w-72),y=d=>h-35-(d-ymin)/(ymax-ymin)*(h-55);
+ ctx.font='11px system-ui';ctx.strokeStyle='#dce5f0';ctx.fillStyle='#53647c';
+ for(let i=0;i<=4;i++){const d=ymin+(ymax-ymin)*i/4,yy=y(d);ctx.beginPath();ctx.moveTo(48,yy);ctx.lineTo(w-15,yy);ctx.stroke();ctx.fillText(d.toFixed(1),8,yy+4);}
+ for(let i=0;i<=4;i++){const t=tmax*i/4;ctx.fillText(t.toFixed(1),x(t)-8,h-17);}ctx.fillText('Time (s)',w/2-15,h-2);ctx.fillText('px',9,13);
+ ctx.strokeStyle=eye==='left'?'#2563eb':'#dc4444';ctx.lineWidth=1.4;ctx.beginPath();let pen=false;
+ for(const s of samples){if(!s.valid||!Number.isFinite(s.diameter_px)){pen=false;continue;}if(pen)ctx.lineTo(x(s.time_s),y(s.diameter_px));else ctx.moveTo(x(s.time_s),y(s.diameter_px));pen=true;}ctx.stroke();
+}
+function render(data){
+ current=data;plot('left');plot('right');$('metrics').replaceChildren();const fmt=v=>Number.isFinite(v)?v.toFixed(2):'—';
+ for(const e of data.metrics.events||[]){const direct=e.stimulus.led_index===1?'left':'right';for(const key of ['direct','consensual']){const r=e[key],tr=document.createElement('tr');for(const v of [e.event_id,key==='direct'?direct:(direct==='left'?'right':'left'),key,fmt(r.mca_px),fmt(r.mcv_px_s),fmt(r.latency_ms)]){const td=document.createElement('td');td.textContent=v;tr.append(td);}if(r.error)tr.title=r.error;$('metrics').append(tr);}}
+ $('resultStatus').textContent=`${data.session_id} · ${data.status} · ${data.analysis_source||'unknown'} analysis`;
+ const warnings=[...(data.metrics.warnings||[]),...Object.values(data.pupilogram.failures||{})];if(warnings.length)$('resultStatus').textContent+=' · '+warnings.join(' · ');
+ const base='/sessions/'+encodeURIComponent(data.session_id);$('video').href=base+'/video';$('json').href=base+'/results';$('links').hidden=false;
+}
+async function sessions(preferred){const data=await get('/sessions');const selected=$('session').value;const items=data.sessions||[];$('session').replaceChildren();for(const s of items){const op=document.createElement('option');op.value=s.session_id;op.textContent=s.session_id;$('session').append(op);}if(items.some(s=>s.session_id===preferred))$('session').value=preferred;else if(items.some(s=>s.session_id===selected))$('session').value=selected;selection=$('session').value;$('reanalyze').disabled=!selection;}
+async function results(){if(!selection)return;try{render(await get('/sessions/'+encodeURIComponent(selection)+'/results'));}catch(e){current=null;plot('left');plot('right');$('metrics').replaceChildren();$('links').hidden=true;$('resultStatus').textContent=e.message==='not ready'?'Results are not ready. Wait for analysis or analyze this saved video.':e.message;}}
+$('session').onchange=async()=>{selection=$('session').value;await results();};
+$('reanalyze').onclick=async()=>{if(!selection)return;try{$('reanalyze').disabled=true;await get('/sessions/'+encodeURIComponent(selection)+'/reanalyze',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({promote:true})});signature='';}catch(e){$('message').textContent=e.message;$('reanalyze').disabled=false;}};
+async function poll(){
+ try{const [s,p]=await Promise.all([get('/status'),get('/purest')]);const bg=s.background,working=bg?.state==='running';const f=s.progress?.fraction;
+ $('stage').textContent=working?`Analyzing saved experiment · ${Math.round((bg.fraction||0)*100)}%`:`${s.stage.toUpperCase()}${Number.isFinite(f)?' · '+Math.round(f*100)+'%':''}`;
+ $('message').textContent=s.error||((bg?.state==='error')?bg.error:'')||'';
+ const live=p.live;$('tracker').textContent=live.running?'Live tracker running · '+(live.variant||'Soft Flow Lite'):(live.error||p.binary.error||'Live tracking disabled; saved-video analysis remains available.');
+ const key=JSON.stringify([s.session_id,s.stage,s.ended_at,bg?.state,bg?.session_id]);
+ if(!loaded||key!==signature){const preferred=(!loaded||s.session_id!==activeSession)?s.session_id:selection;await sessions(preferred);await results();loaded=true;signature=key;activeSession=s.session_id;}
+ $('reanalyze').disabled=!selection||working||['recording','starting','analysis'].includes(s.stage);
+ }catch(e){$('message').textContent='Could not contact the Pi: '+e.message;}finally{setTimeout(poll,1200);}
+}
+window.addEventListener('resize',()=>{plot('left');plot('right');});plot('left');plot('right');poll();
+</script>
+</html>

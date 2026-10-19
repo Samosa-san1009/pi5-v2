@@ -25,6 +25,7 @@
 //   char[4] magic "PLR1" | u32 flags | u64 seq | i64 timestamp_ns
 //   | u32 width | u32 height | width*height bytes (8-bit grey, row-major)
 //   flags bit0 = reset both trackers before this frame (new session)
+//   flags bit1 = decimated idle preview (not a recording measurement)
 //
 // stdout lines, stream mode:
 //   READY <version>
@@ -64,7 +65,7 @@
 #include "soft_flow.hpp"
 #include "eye_locator.hpp"
 
-#define PLR_PUREST_VERSION "2.2.0-softflow-lite-eyes"
+#define PLR_PUREST_VERSION "2.3.0-softflow-lite-preview"
 
 namespace {
 
@@ -220,6 +221,7 @@ struct Job {
     uint64_t seq = 0;
     int64_t ts = 0;
     bool reset = false;
+    bool preview = false;
     plr::EyeRegions regions;
 };
 
@@ -332,7 +334,7 @@ private:
             if (roi != previous_roi_) tracker_.reset();
             previous_roi_ = roi;
             if (roi.width >= 16 && roi.height >= 16) {
-                const auto detection = tracker_.run(frame(roi), job.seq, job.ts);
+                const auto detection = tracker_.run(frame(roi), job.seq, job.ts, job.preview);
                 const auto &pupil = detection.pupil;
                 r.confidence = pupil.confidence;
                 r.outline_confidence = pupil.outline_confidence;
@@ -534,6 +536,7 @@ int run_stream(const Options &opt) {
         job.seq = seq;
         job.ts = ts;
         job.reset = (flags & 1u) != 0;
+        job.preview = (flags & 2u) != 0;
         if (opt.localization.automatic) job.regions = locator.locate(*grey, job.seq, job.ts, job.reset);
         else {
             for (int e = 0; e < 2; ++e) job.regions.eye[e] = pixel_roi(opt.roi[e], grey->cols, grey->rows);

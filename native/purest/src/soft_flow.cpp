@@ -197,9 +197,14 @@ bool SoftFlow::flow(const cv::Mat &gray, Pupil &prediction) const {
     return true;
 }
 
-Detection SoftFlow::run(const cv::Mat &eye, uint64_t seq, int64_t timestamp_ns) {
-    const bool discontinuity = have_frame_ && (seq != last_seq_ + 1 || eye.size() != source_size_ ||
-        timestamp_ns <= last_ts_ || (timestamp_ns - last_ts_) > config_.max_gap_ms * 1e6);
+Detection SoftFlow::run(const cv::Mat &eye, uint64_t seq, int64_t timestamp_ns, bool preview) {
+    // Idle input is intentionally decimated (normally 5 fps). Camera sequence
+    // gaps and 200 ms spacing there are not dropped recording frames. Preserve
+    // two-observation confirmation, but never bridge idle frames with flow.
+    const float gap_ms = preview ? std::max(1000.f, config_.max_gap_ms) : config_.max_gap_ms;
+    const bool discontinuity = have_frame_ && (preview != was_preview_ ||
+        (!preview && seq != last_seq_ + 1) || eye.size() != source_size_ ||
+        timestamp_ns <= last_ts_ || (timestamp_ns - last_ts_) > gap_ms * 1e6);
     if (discontinuity) reset();
     source_size_ = eye.size();
     const float scale = std::min(1.f, static_cast<float>(config_.work_size) / std::max(eye.cols, eye.rows));
@@ -221,7 +226,7 @@ Detection SoftFlow::run(const cv::Mat &eye, uint64_t seq, int64_t timestamp_ns) 
     const bool baseline_ok = baseline.confidence >= config_.confidence &&
         geometry(baseline, gray.size(), scale, .65f) && contrast(gray, baseline) >= config_.min_contrast;
     const bool recent = anchor_.hasOutline() && lost_ <= config_.flow_frames &&
-        timestamp_ns - anchor_ts_ <= config_.max_gap_ms * 1e6;
+        timestamp_ns - anchor_ts_ <= gap_ms * 1e6;
     if (baseline_ok && ((recent && consistent(baseline, anchor_)) ||
         (!recent && pending_.hasOutline() && consistent(baseline, pending_)))) {
         result.pupil = baseline;
@@ -246,7 +251,7 @@ Detection SoftFlow::run(const cv::Mat &eye, uint64_t seq, int64_t timestamp_ns) 
             result.pupil = soft;
             result.valid = true;
             result.source = prior ? "soft_contrast" : "reacquired";
-        } else if (recent && lost_ < config_.flow_frames && soft.hasOutline()) {
+        } else if (!preview && recent && lost_ < config_.flow_frames && soft.hasOutline()) {
             Pupil prediction;
             if (flow(gray, prediction) && geometry(prediction, gray.size(), scale, .65f) &&
                 consistent(soft, prediction) && contrast(gray, prediction) >= config_.min_contrast) {
@@ -273,6 +278,7 @@ Detection SoftFlow::run(const cv::Mat &eye, uint64_t seq, int64_t timestamp_ns) 
     last_seq_ = seq;
     last_ts_ = timestamp_ns;
     have_frame_ = true;
+    was_preview_ = preview;
     // Resizing rounds the actual dimensions. Use exact inverse scales.
     if (result.pupil.hasOutline() && gray.size() != eye.size()) {
         // Transform sampled boundary points to preserve rotated ellipses.
