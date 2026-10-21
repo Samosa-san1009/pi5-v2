@@ -26,10 +26,29 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from plr import purest  # noqa: E402
 from plr.settings import SettingsStore, validate  # noqa: E402
+from plr.analysis.postprocess import extract_eye, write_extraction  # noqa: E402
 
 
 def measured(row):
     return row["Valid"] == "1" and row.get("Estimated", "0") != "1"
+
+
+def smooth(rows, output, recording_id):
+    """No flash log accompanies a standalone video: smooth, without MCA/MCV."""
+    summary = {}
+    for eye, records in rows.items():
+        trace = purest._empty_trace(len(records))
+        times = np.array([int(r["Timestamp_ns"])/1e9 for r in records])
+        times -= times[0]
+        for i, r in enumerate(records):
+            purest._fill(trace, i, measured(r), number(r, "Confidence"), number(r, "Diameter_px"),
+                         number(r, "Minor_px"), number(r, "Center_x"), number(r, "Center_y"), 0.,
+                         source=r.get("Source", "missing"), estimated=r.get("Estimated") == "1",
+                         visibility=r.get("Visibility", "unknown"))
+        processed, pairs = extract_eye(trace, times, [], recording_id, eye)
+        write_extraction(output / "extraction", eye, processed, pairs)
+        summary[eye] = {k: v for k, v in processed.items() if k != "samples"}
+    return summary
 
 
 def number(row, key):
@@ -169,6 +188,8 @@ def main():
         }
     localization_ms = [int(r["Localization_us"]) / 1000 for r in rows["left"] if int(r["Localization_us"]) > 0]
     summary["localization_search_p95_ms"] = round(float(np.percentile(localization_ms, 95)), 3) if localization_ms else 0
+    summary["postprocessing"] = smooth(rows, args.output, args.video.stem)
+    summary["notes"].append("No flash log supplied: extraction smoothing/interpolation only; MCA and MCV were not calculated.")
     (args.output / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     plot(rows, args.output, args.video.name + " · bilateral pupilogram")
     if not args.skip_overlay:

@@ -20,7 +20,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .plr_metrics import calculate_plr_metrics
+from .postprocess import METHOD, PARAMETERS, extract_eye, response_metrics, write_extraction
 
 EYE_OF_LED = {1: "left", 2: "right"}
 
@@ -53,8 +53,13 @@ def build_results(session_dir: Path, session_id: str, traces: dict, source: str,
     _, times = load_frame_times(session_dir)
     fps = nominal_fps(times, float(settings["camera"]["fps"]))
     width, height = settings["camera"]["resolution"]
-    window_pre = float(settings["session"].get("window_pre_s", 1.5))
-    window_post = float(settings["session"].get("window_post_s", 3.0))
+    processed, selections = {}, {}
+    extraction_dir = session_dir / f"extraction{suffix}"
+    for eye in ("left", "right"):
+        trace = traces.get(eye)
+        t = _times(len(trace["valid"]), times, fps) if trace is not None else np.array([])
+        processed[eye], selections[eye] = extract_eye(trace, t, events, session_id, eye)
+        write_extraction(extraction_dir, eye, processed[eye], selections[eye])
 
     failures = {}
     for eye in ("left", "right"):
@@ -65,13 +70,13 @@ def build_results(session_dir: Path, session_id: str, traces: dict, source: str,
             failures[eye] = "Soft Flow Lite found no accepted pupil measurements for this eye (check focus, illumination and eye boxes)"
 
     metric_events = []
-    for event in events:
+    for i, event in enumerate(events):
         direct_eye = EYE_OF_LED[event["led_index"]]
         other_eye = "right" if direct_eye == "left" else "left"
-        direct = _window(traces.get(direct_eye), times, fps, event["onset_s"], window_pre, window_post,
-                         failures.get(direct_eye))
-        consensual = _window(traces.get(other_eye), times, fps, event["onset_s"], window_pre, window_post,
-                             failures.get(other_eye))
+        def response(eye):
+            pair = selections[eye][i] if len(selections[eye]) > i else None
+            return response_metrics(pair, processed[eye], event)
+        direct, consensual = response(direct_eye), response(other_eye)
         statuses = {direct["status"], consensual["status"]}
         status = "error" if statuses == {"error"} else ("partial" if "error" in statuses else "ok")
         metric_events.append({"event_id": event.get("event_id"), "status": status, "stimulus": event,
@@ -79,7 +84,8 @@ def build_results(session_dir: Path, session_id: str, traces: dict, source: str,
 
     ok_eyes = sum(1 for eye in ("left", "right") if eye not in failures)
     event_errors = sum(e["status"] != "ok" for e in metric_events)
-    status = "error" if ok_eyes == 0 else ("partial" if ok_eyes < 2 or event_errors else "ok")
+    processing_errors = any(p["status"] != "ok" for p in processed.values())
+    status = "error" if ok_eyes == 0 else ("partial" if ok_eyes < 2 or event_errors or processing_errors else "ok")
 
     roi_px = {eye: _roi_px(settings["eye_roi"][eye], width, height) for eye in ("left", "right")}
     analyzer_config = {
@@ -94,7 +100,7 @@ def build_results(session_dir: Path, session_id: str, traces: dict, source: str,
         for eye in ("left", "right")
     }
     pupilogram = {
-        "schema_version": 3,
+        "schema_version": 4,
         "session_id": session_id,
         "analyzer": "purest",
         "analysis_source": source,
@@ -104,10 +110,11 @@ def build_results(session_dir: Path, session_id: str, traces: dict, source: str,
         "source_video": {"path": str(session_dir / "full_video.mp4"), "fps": round(fps, 6),
                          "frames_with_timestamps": int(len(times))},
         "eyes": {eye: _trace_output(traces.get(eye), times, fps, analyzer_config[eye]) for eye in ("left", "right")},
+        "postprocessing": {"method": METHOD, "parameters": PARAMETERS},
         "failures": failures,
     }
     metrics = {
-        "schema_version": 3,
+        "schema_version": 4,
         "session_id": session_id,
         "participant": participant or {},
         "status": status,
@@ -117,14 +124,19 @@ def build_results(session_dir: Path, session_id: str, traces: dict, source: str,
         "coverage": {eye: (traces.get(eye) or {}).get("coverage") for eye in ("left", "right")},
         "engine": engine or {},
         "definitions": {
-            "mca": "baseline median minus minimum post-flash diameter",
-            "mcv": "largest constriction speed from onset to minimum",
-            "latency": "constriction onset minus optically measured flash onset",
+            "mca": "extraction: preceding 0.667 s median minus minimum within 3.333 s, bounded by flash offset",
+            "mcv": "extraction: maximum negative interior central derivative within the selected constriction phase",
+            "latency": "selected phase start minus sampled flash onset; exact event time is also retained",
         },
+        "postprocessing": {"method": METHOD, "parameters": PARAMETERS},
+        "extraction": {eye: {k: v for k, v in processed[eye].items() if k != "samples"} for eye in processed},
         "flash_timing": timeline.get("optical"),
         "warnings": timeline.get("warnings", []),
         "events": metric_events,
     }
+    for eye in ("left", "right"):
+        if pupilogram["eyes"][eye] is not None:
+            pupilogram["eyes"][eye]["processed"] = processed[eye]
     _write(session_dir / f"pupilogram{suffix}.json", pupilogram)
     _write(session_dir / f"metrics{suffix}.json", metrics)
     return {"status": status, "source": source, "coverage": metrics["coverage"]}
@@ -134,24 +146,6 @@ def _times(n: int, times: np.ndarray, fps: float) -> np.ndarray:
     if len(times) >= n:
         return times[:n]
     return np.arange(n, dtype=float) / fps
-
-
-def _window(trace, times, fps, onset_s, pre, post, failure) -> dict:
-    if trace is None or failure:
-        return {"status": "error", "error": failure or "eye trace unavailable"}
-    n = len(trace["valid"])
-    t = _times(n, times, fps)
-    mask = (t >= max(0.0, onset_s - pre)) & (t <= onset_s + post) & trace["valid"]
-    if not mask.any():
-        return {"status": "error", "error": "no valid samples in event window"}
-    try:
-        result = calculate_plr_metrics(
-            np.flatnonzero(mask), trace["diameter_px"][mask], fps=fps, flash_onset_s=onset_s,
-            smoothing_window=int(os.environ.get("PLR_SMOOTHING_WINDOW", "5")), times_s=t[mask])
-        result.pop("diameter_series", None)
-        return {"status": "ok", "time_base": "sensor_timestamps" if len(times) else "nominal_fps", **result}
-    except Exception as exc:
-        return {"status": "error", "error": str(exc)}
 
 
 def _trace_output(trace, times, fps, config):

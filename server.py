@@ -212,6 +212,14 @@ def write_manifest(paths: dict, config: dict, settings: dict):
 
 
 def copy_results(session_dir: Path, from_suffix: str, to_suffix: str = ""):
+    extraction = session_dir / f"extraction{from_suffix}"
+    if extraction.is_dir():
+        destination = session_dir / f"extraction{to_suffix}"
+        shutil.copytree(extraction, destination, dirs_exist_ok=True)
+        for eye in ("left", "right"):
+            name = f"{eye}_pupillogram.png"
+            if not (extraction / name).is_file():
+                (destination / name).unlink(missing_ok=True)
     for stem in ("pupilogram", "metrics"):
         src = session_dir / f"{stem}{from_suffix}.json"
         dst = session_dir / f"{stem}{to_suffix}.json"
@@ -557,6 +565,23 @@ def session_video(session_id):
     if not path.is_file():
         return jsonify({"error": "no video"}), 404
     return send_file(path, mimetype="video/mp4", as_attachment=True)
+
+
+@app.route("/sessions/<session_id>/extraction/<eye>/<artifact>", methods=["GET"])
+def extraction_artifact(session_id, eye, artifact):
+    source = request.args.get("source", "")
+    if eye not in ("left", "right") or source not in ("", "live", "offline") or artifact not in (
+            "smoothed.csv", "smoothed.json", "mca.csv", "mcv.csv", "pupillogram.png"):
+        return jsonify({"error": "unknown extraction artifact"}), 404
+    try:
+        root = session_dir_for(session_id)
+    except (ValueError, FileNotFoundError):
+        return jsonify({"error": "unknown session"}), 404
+    suffix = f"_{source}" if source else ""
+    path = root / f"extraction{suffix}" / f"{eye}_{artifact}"
+    if not path.is_file():
+        return jsonify({"error": "extraction not available; analyze this saved session again"}), 404
+    return send_file(path, max_age=0, as_attachment=not artifact.endswith(".png"))
 
 
 @app.route("/sessions/<session_id>/reanalyze", methods=["POST"])

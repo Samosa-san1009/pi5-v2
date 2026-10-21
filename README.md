@@ -357,7 +357,9 @@ plr/
   display.py                 TFT live view with eye boxes and pupil circles
   timebase.py                clocks (monotonic for timing, NTP / Pi RTC for dates)
   analysis/results.py        pupilogram + metrics JSON (the shape the app reads)
-  analysis/plr_metrics.py    baseline, latency, MCA, MCV
+  analysis/postprocess.py    rig timestamps/events -> extraction smoothing and metrics
+  analysis/extraction/       project extraction: interpolation, filtering, MCA, MCV, plots
+  analysis/plr_metrics.py    legacy metric helpers (not used for session results)
 native/purest/
   src/plr_purest.cpp         PuReST engine: both eyes in parallel, --stream and --input modes
   src/soft_flow.cpp          bounded grayscale recovery + sparse LK; no neural models
@@ -392,6 +394,9 @@ After building the native engine, use the optional desktop analysis tools:
 
 This exports `left.csv`, `right.csv`, `pupilogram.png`, `pupilogram.svg`,
 `summary.json`, and `overlay.mp4` with eye boxes and measured pupil circles.
+It also exports smoothed plots and processing-stage CSVs for both eyes under
+`extraction/`. No flash log accompanies standalone input, so this command
+does not calculate MCA/MCV. Recorded rig sessions use their saved flash log.
 CSV/plots retain source presentation timestamps. The overlay is a nominal-fps
 review copy. Diameters are camera pixels; no millimetre calibration is assumed.
 Media stays in the ignored output folder. For synthetic mock-camera eyes,
@@ -408,6 +413,14 @@ live eye boxes/pupil circles, recording/analysis progress, both final
 pupilograms, per-flash metrics, video download, and saved experiments.
 Use **Analyze saved video again** to rerun and publish a selected session's
 result. The existing app still reads the same `/results` endpoint.
+
+Final session results now use the project's extraction smoothing,
+interpolation, MCA and MCV functions. The monitor shows annotated MCA/MCV
+plots and quality flags, with CSV downloads for each eye. The raw samples
+remain available alongside the processed curve. Existing Pis need the new
+`python3-scipy` and `python3-matplotlib` APT packages before restarting.
+See [Extraction integration](docs/EXTRACTION.md) for update commands, formulas,
+timing alignment and exports.
 
 After updating an existing Pi checkout:
 

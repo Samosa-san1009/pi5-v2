@@ -3,6 +3,7 @@
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Mobile PLR · Live tracking and results</title>
 <style>
+[hidden]{display:none!important}
 body{margin:0;background:#f4f7fb;color:#162238;font:15px system-ui,sans-serif}main{max-width:1120px;margin:auto;padding:24px}h1{font-size:25px;margin:0 0 8px}h2{font-size:18px}p{line-height:1.5}.card{background:white;border:1px solid #dde5ef;border-radius:12px;padding:20px;margin:16px 0}.grid{display:grid;grid-template-columns:1fr 1fr;gap:20px}img{display:block;width:100%;min-height:150px;background:#111827;border-radius:8px}#stage{font-weight:600;color:#234f94}#message{white-space:pre-wrap;color:#a52a2a}select,button{font:inherit;border:1px solid #bac9df;border-radius:6px;background:white;padding:9px;color:#17417a}button:disabled{opacity:.5}select{max-width:100%}canvas{display:block;width:100%;height:240px}.quiet{font-size:13px;color:#53647c}table{width:100%;border-collapse:collapse;font-size:13px}td,th{text-align:left;border-bottom:1px solid #e4eaf2;padding:9px 5px}.scroll{overflow:auto}a{color:#245fb3}#links{display:flex;gap:18px;margin-top:12px}#links[hidden]{display:none}@media(max-width:720px){main{padding:12px}.grid{grid-template-columns:1fr}.card{padding:14px}canvas{height:210px}}
 </style>
 <main>
@@ -19,9 +20,11 @@ body{margin:0;background:#f4f7fb;color:#162238;font:15px system-ui,sans-serif}ma
  <p id="resultStatus" class="quiet">Waiting for a recording.</p>
  <div id="links" hidden><a id="video">Recorded video</a><a id="json">Full result JSON</a></div>
  <h2 id="leftTitle">Left-eye pupilogram</h2><canvas id="left" aria-label="Left-eye pupil diameter versus time"></canvas>
+ <a id="leftPlotLink" target="_blank" hidden><img id="leftPlot" alt="Left-eye processed pupilogram with MCA amplitude markers and MCV tangent" hidden></a><p id="leftFiles" class="quiet"></p>
  <h2 id="rightTitle">Right-eye pupilogram</h2><canvas id="right" aria-label="Right-eye pupil diameter versus time"></canvas>
- <p class="quiet">Diameter is in camera pixels. Rejected frames and flow-only estimates remain gaps. A valid-frame percentage is coverage, not an accuracy score.</p>
- <h2>Per-flash responses</h2><div class="scroll"><table><thead><tr><th>Flash</th><th>Eye</th><th>Response</th><th>MCA (px)</th><th>MCV (px/s)</th><th>Latency (ms)</th></tr></thead><tbody id="metrics"></tbody></table></div>
+ <a id="rightPlotLink" target="_blank" hidden><img id="rightPlot" alt="Right-eye processed pupilogram with MCA amplitude markers and MCV tangent" hidden></a><p id="rightFiles" class="quiet"></p>
+ <p id="plotLegend" class="quiet"></p>
+ <h2>Per-flash responses</h2><div class="scroll"><table><thead><tr><th>Flash</th><th>Eye</th><th>Response</th><th>MCA (px)</th><th>MCV (px/s)</th><th>Latency (ms)</th><th>Extraction quality</th></tr></thead><tbody id="metrics"></tbody></table></div>
 </section>
 </main>
 <script>
@@ -44,13 +47,20 @@ function plot(eye){
 }
 function render(data){
  current=data;plot('left');plot('right');$('metrics').replaceChildren();const fmt=v=>Number.isFinite(v)?v.toFixed(2):'—';
- for(const e of data.metrics.events||[]){const direct=e.stimulus.led_index===1?'left':'right';for(const key of ['direct','consensual']){const r=e[key],tr=document.createElement('tr');for(const v of [e.event_id,key==='direct'?direct:(direct==='left'?'right':'left'),key,fmt(r.mca_px),fmt(r.mcv_px_s),fmt(r.latency_ms)]){const td=document.createElement('td');td.textContent=v;tr.append(td);}if(r.error)tr.title=r.error;$('metrics').append(tr);}}
+ const hasEvents=Boolean(data.metrics.events?.length);$('plotLegend').textContent='Grey: observed diameter. Blue: extraction-smoothed curve. Amber dots: interpolated samples. '+(hasEvents?'Top panel: MCA baseline-to-minimum arrow. Lower panel: peak MCV tangent and dashed averaged-velocity segment. ':'No flash timings supplied: MCA and MCV were not calculated. ')+'Click a plot for full size. Long gaps and declared blinks remain missing; interpolation never counts as observed coverage.';
+ for(const e of data.metrics.events||[]){const direct=e.stimulus.led_index===1?'left':'right';for(const key of ['direct','consensual']){const r=e[key],tr=document.createElement('tr');const flags=(r.quality_flags||[]).join('; '),quality=r.mca_status?`MCA: ${r.mca_status}; MCV: ${r.mcv_status}${flags?' · '+flags:''}`:(r.error||r.status);for(const v of [e.event_id,key==='direct'?direct:(direct==='left'?'right':'left'),key,fmt(r.mca_px),fmt(r.mcv_px_s),fmt(r.latency_ms),quality]){const td=document.createElement('td');td.textContent=v;tr.append(td);}if(r.error)tr.title=r.error;$('metrics').append(tr);}}
  $('resultStatus').textContent=`${data.session_id} · ${data.status} · ${data.analysis_source||'unknown'} analysis`;
  const warnings=[...(data.metrics.warnings||[]),...Object.values(data.pupilogram.failures||{})];if(warnings.length)$('resultStatus').textContent+=' · '+warnings.join(' · ');
  const base='/sessions/'+encodeURIComponent(data.session_id);$('video').href=base+'/video';$('json').href=base+'/results';$('links').hidden=false;
+ for(const eye of ['left','right']){const processed=data.pupilogram.eyes?.[eye]?.processed, image=$(eye+'Plot'),link=$(eye+'PlotLink'),files=$(eye+'Files');files.replaceChildren();image.hidden=true;link.hidden=true;$(eye).hidden=false;
+  if(!processed){files.textContent='Historical raw result. Analyze this saved video again to add extraction.';continue;}
+  const meta=processed.metadata||{};files.append(document.createTextNode(`${processed.status} · ${meta.interpolated_frames||0} interpolated frames · ${meta.smoothed_frames||0} filtered frames${processed.error?' · '+processed.error:''}. `));
+  const root=base+'/extraction/'+eye+'/';for(const [name,label] of [['smoothed.csv','Processed CSV'],['mca.csv','MCA CSV'],['mcv.csv','MCV CSV']]){const a=document.createElement('a');a.href=root+name;a.textContent=label;files.append(a,document.createTextNode(' · '));}
+  if(processed.samples?.length){const url=root+'pupillogram.png?v='+Date.now();image.alt=eye+' eye smoothed pupilogram'+(hasEvents?' with MCA amplitude markers and MCV tangent':' · no flash timing, smoothing only');image.onload=()=>{image.hidden=false;link.hidden=false;$(eye).hidden=true;};image.onerror=()=>{image.hidden=true;link.hidden=true;$(eye).hidden=false;};link.href=url;image.src=url;}
+ }
 }
 async function sessions(preferred){const data=await get('/sessions');const selected=$('session').value;const items=data.sessions||[];$('session').replaceChildren();for(const s of items){const op=document.createElement('option');op.value=s.session_id;op.textContent=s.session_id;$('session').append(op);}if(items.some(s=>s.session_id===preferred))$('session').value=preferred;else if(items.some(s=>s.session_id===selected))$('session').value=selected;selection=$('session').value;$('reanalyze').disabled=!selection;}
-async function results(){if(!selection)return;try{render(await get('/sessions/'+encodeURIComponent(selection)+'/results'));}catch(e){current=null;plot('left');plot('right');$('metrics').replaceChildren();$('links').hidden=true;$('resultStatus').textContent=e.message==='not ready'?'Results are not ready. Wait for analysis or analyze this saved video.':e.message;}}
+async function results(){if(!selection)return;try{render(await get('/sessions/'+encodeURIComponent(selection)+'/results'));}catch(e){current=null;plot('left');plot('right');for(const eye of ['left','right']){$(eye+'PlotLink').hidden=true;$(eye).hidden=false;$(eye+'Files').replaceChildren();}$('metrics').replaceChildren();$('links').hidden=true;$('resultStatus').textContent=e.message==='not ready'?'Results are not ready. Wait for analysis or analyze this saved video.':e.message;}}
 $('session').onchange=async()=>{selection=$('session').value;await results();};
 $('reanalyze').onclick=async()=>{if(!selection)return;try{$('reanalyze').disabled=true;await get('/sessions/'+encodeURIComponent(selection)+'/reanalyze',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({promote:true})});signature='';}catch(e){$('message').textContent=e.message;$('reanalyze').disabled=false;}};
 async function poll(){

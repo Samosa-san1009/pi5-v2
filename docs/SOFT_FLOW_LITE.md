@@ -34,9 +34,12 @@ before the next scheduled search. Mode transitions reset temporal evidence.
 
 `/preview.jpg` and `/stream.mjpg` now draw fresh eye boxes and pupil circles;
 `?overlay=0` provides raw IR. `/monitor` (also `/`) adds browser pupilograms,
-metrics, progress, diagnostics and a saved-session reanalysis button. It uses
-Pillow and browser canvas, so the Pi server needs no Matplotlib or Python
-OpenCV. Native binaries older than 2.3.0 are rejected with a rebuild instruction.
+metrics, progress, diagnostics and a saved-session reanalysis button. Live
+preview uses Pillow; final annotated plots now use the project's extraction
+code with SciPy/Matplotlib after recording. Python OpenCV is not needed by
+the Pi server. See [Extraction integration](EXTRACTION.md) for the dependencies,
+smoothing, interpolation and metric details. Native binaries older than 2.3.0
+are rejected with a rebuild instruction.
 
 ## Finding eyes in a full-face camera frame
 

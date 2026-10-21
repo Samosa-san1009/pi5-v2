@@ -1,5 +1,5 @@
 # pip packages for the Pi (installed into .venv by scripts/install.sh).
-# Everything else (picamera2, libcamera, numpy, Pillow, Flask, lgpio, spidev)
+# Everything else (picamera2, libcamera, numpy, SciPy, Matplotlib, Pillow, Flask, lgpio, spidev)
 # comes from APT so it matches the OS's camera stack.
 luma.lcd>=2.11
 Adafruit-Blinka>=8.50

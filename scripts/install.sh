@@ -66,7 +66,7 @@ say "3. Installing APT packages"
 sudo apt-get update
 sudo apt-get install -y \
   python3-venv python3-pip python3-dev build-essential \
-  python3-picamera2 python3-libcamera python3-numpy python3-pil python3-flask \
+  python3-picamera2 python3-libcamera python3-numpy python3-scipy python3-matplotlib python3-pil python3-flask \
   python3-lgpio python3-spidev \
   ffmpeg cmake g++ pkg-config libopencv-dev util-linux
 for optional in python3-av python3-simplejpeg rpicam-apps; do
